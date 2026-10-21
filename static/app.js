@@ -13,6 +13,7 @@ const icons = {
   sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
   cloud:'<path d="M6 18a5 5 0 1 1 1-10 6 6 0 0 1 11 2 4 4 0 1 1 0 8Z"/>',
   rain:'<path d="M5 15a4 4 0 1 1 2-8 5 5 0 0 1 10 1 4 4 0 0 1 2 7M8 18l-1 3m6-3-1 3m6-3-1 3"/>',
+  snow:'<path d="M12 2v20M3.3 7l17.4 10M3.3 17 20.7 7M9 4l3 3 3-3M9 20l3-3 3 3M4 10l4-1-1-4m13 9-4 1 1 4M4 14l4 1-1 4m13-9-4-1 1-4"/>',
   fog:'<path d="M4 9h16M2 13h14m3 0h3M5 17h14M8 5h8"/>',
   terminal:'<path d="m4 7 5 5-5 5m8 0h8"/>',
   arrow:'<path d="M4 12h16m-6-6 6 6-6 6"/>',
@@ -79,9 +80,10 @@ $('#retry-feed').addEventListener('click',()=>{try {connectXpra(activeXpraUrl,fa
 $('#disconnect-feed').addEventListener('click',disconnectXpra);
 const options = {
   scene: [{id:'mountain', name:'山地探索', detail:'Alpine Valley', preset:'mountain'}, {id:'city', name:'城市巡航', detail:'Urban District', preset:'city'}, {id:'coast', name:'海岸漫游', detail:'Coastal Escape', preset:'coast'}],
-  weather: [{id:'clear', name:'晴朗', detail:'Clear skies', preset:'sun'}, {id:'cloudy', name:'多云', detail:'Cloudy skies', preset:'cloud'}, {id:'rain', name:'小雨', detail:'Light rain', preset:'rain'}, {id:'fog', name:'薄雾', detail:'Gentle mist', preset:'fog'}]
+  weather: Object.freeze([{id:'clear', name:'晴朗', detail:'Clear skies', preset:'sun'}, {id:'rain', name:'雨天', detail:'Rain', preset:'rain'}, {id:'fog', name:'雾天', detail:'Fog', preset:'fog'}, {id:'snow', name:'雪天', detail:'Snow', preset:'snow'}])
 };
-const selected = {scene:'mountain', weather:'clear'};
+const selected = {scene:'mountain', weather:null};
+let weatherPending = false;
 function renderList(type) {
   const list = $('#'+type+'-list');
   list.replaceChildren();
@@ -90,6 +92,7 @@ function renderList(type) {
     button.className='scene-button option-button'+(selected[type]===item.id?' selected':'');
     button.setAttribute('aria-pressed',String(selected[type]===item.id));
     button.dataset.option=item.id;
+    if(type==='weather') button.disabled=weatherPending;
     const thumb=document.createElement('span');
     thumb.className=type==='scene'?'scene-thumb '+item.preset:'weather-symbol';
     if(type==='weather') thumb.innerHTML=icon(item.preset);
@@ -101,15 +104,39 @@ function renderList(type) {
     const indicator=document.createElement('span'); indicator.className='selection-indicator';
     button.append(thumb,label,indicator);
     button.addEventListener('click',()=>{
+      if(type==='weather') {applyWeather(item); return;}
       selected[type]=item.id;
       if(type==='scene') {viewport.dataset.scene=item.preset; $('.landscape').setAttribute('aria-label',item.name+'原始演示画面'); if(remoteActive) toast('场景选择仅记录在界面中，远程 AirSim 场景切换接口待接入');}
-      else toast('已选择「'+item.name+'」，天气效果将在模拟器接口接入后生效');
       const position=list.scrollTop; renderList(type); list.scrollTop=position;
     });
     list.append(button);
   });
   $('#'+type+'-count').textContent=String(options[type].length).padStart(2,'0')+' 项';
-  document.querySelector('[data-remove="'+type+'"]').disabled=options[type].length<=1;
+  if(type==='scene') document.querySelector('[data-remove="scene"]').disabled=options.scene.length<=1;
+}
+async function applyWeather(item) {
+  if(weatherPending) return;
+  weatherPending=true;
+  const list=$('#weather-list'); const position=list.scrollTop;
+  const status=$('#weather-status');
+  status.textContent='正在切换至「'+item.name+'」…'; status.dataset.state='pending';
+  list.setAttribute('aria-busy','true'); renderList('weather'); list.scrollTop=position;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),35000);
+  try {
+    const response=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weather:item.id}),signal:controller.signal});
+    const result=await response.json();
+    if(!response.ok || result.status!=='applied' || result.weather!==item.id) throw new Error(result.message || '天气切换失败，请检查 AirSim 连接');
+    selected.weather=item.id;
+    status.textContent='已应用：'+item.name; status.dataset.state='success';
+    toast('已将 AirSim 天气切换为「'+item.name+'」');
+  } catch(error) {
+    selected.weather=null;
+    const message=error.name==='AbortError'?'请求超时，天气状态未确认，请重试':error instanceof SyntaxError?'服务返回异常，请检查 Flask 是否正常运行':error.message;
+    status.textContent=message; status.dataset.state='error'; toast(message);
+  } finally {
+    clearTimeout(timer); weatherPending=false; list.setAttribute('aria-busy','false'); renderList('weather'); list.scrollTop=position;
+  }
 }
 renderList('scene'); renderList('weather');
 document.querySelectorAll('[data-remove]').forEach(button=>button.addEventListener('click',()=>{
@@ -127,16 +154,16 @@ const history = [];
 $('#command-form').addEventListener('submit', e => { e.preventDefault(); const command = $('#command').value.trim(); if (!command) { $('#command').focus(); toast('请输入飞行任务，或选择一条快捷指令'); return; } history.unshift({ command, time: new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); $('#command-feedback').textContent = `已记录「${command}」。当前为 UI 演示，指令尚未发送至无人机。`; $('#command').value = ''; });
 $('#fullscreen').addEventListener('click', async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await viewport.requestFullscreen(); } catch { toast('当前预览环境不支持全屏，请在独立浏览器中打开'); } });
 const captures = [];
-$('#capture').addEventListener('click', () => { if(remoteActive) {toast('远程画面截图需接入图像接口，当前无法保存真实截图');return;} captures.unshift({ scene:options.scene.find(item=>item.id===selected.scene).name, weather:options.weather.find(item=>item.id===selected.weather).name, time:new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); toast('已将当前演示画面信息保存至媒体库（本次会话）'); });
+$('#capture').addEventListener('click', () => { if(remoteActive) {toast('远程画面截图需接入图像接口，当前无法保存真实截图');return;} captures.unshift({ scene:options.scene.find(item=>item.id===selected.scene).name, weather:options.weather.find(item=>item.id===selected.weather)?.name || '天气未设置', time:new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); toast('已将当前演示画面信息保存至媒体库（本次会话）'); });
 const modal = $('#modal');
 function openModal(type) {
   const content = $('#modal-content');
-  if (type === 'add-scene' || type === 'add-weather') {
-    const group=type==='add-scene'?'scene':'weather';
-    const title=group==='scene'?'环境':'天气';
+  if (type === 'add-scene') {
+    const group='scene';
+    const title='环境';
     $('#modal-title').textContent='添加'+title;
-    content.innerHTML='<form id="add-option-form"><label class="modal-field" for="option-name">'+title+'名称</label><input class="modal-input" id="option-name" required maxlength="30" placeholder="输入'+title+'名称"/><label class="modal-field" for="option-preset">'+(group==='scene'?'演示画面模板':'天气图标')+'</label><select class="modal-input" id="option-preset"></select><p>仅添加本次会话中的 UI 选项，实际'+title+'资源将在接口接入后配置。</p><button class="modal-action" type="submit">添加'+title+'</button></form>';
-    const presets=group==='scene'?[['mountain','山地画面'],['city','城市画面'],['coast','海岸画面']]:[['sun','晴朗'],['cloud','多云'],['rain','小雨'],['fog','薄雾']];
+    content.innerHTML='<form id="add-option-form"><label class="modal-field" for="option-name">'+title+'名称</label><input class="modal-input" id="option-name" required maxlength="30" placeholder="输入'+title+'名称"/><label class="modal-field" for="option-preset">'+'演示画面模板'+'</label><select class="modal-input" id="option-preset"></select><p>仅添加本次会话中的 UI 选项，实际'+title+'资源将在接口接入后配置。</p><button class="modal-action" type="submit">添加'+title+'</button></form>';
+    const presets=[['mountain','山地画面'],['city','城市画面'],['coast','海岸画面']];
     presets.forEach(([value,text])=>{const option=document.createElement('option'); option.value=value; option.textContent=text; $('#option-preset').append(option);});
     $('#add-option-form').addEventListener('submit',e=>{
       e.preventDefault(); const name=$('#option-name').value.trim();
@@ -158,7 +185,7 @@ function openModal(type) {
   }
   if (type === 'missions') { $('#modal-title').textContent = '任务记录'; content.replaceChildren(); if (!history.length) content.innerHTML = `<div class="empty-state">${icon('route')}<p>还没有飞行指令</p><p>在控制台输入任务，指令记录将显示在这里。</p></div>`; else history.forEach(item => { const row = document.createElement('div'); row.className = 'media-item'; row.textContent = `${item.time} · ${item.command} · 未执行（演示）`; content.append(row); }); }
   if (type === 'media') { $('#modal-title').textContent = '媒体库'; content.replaceChildren(); if (!captures.length) content.innerHTML = `<div class="empty-state">${icon('camera')}<p>你的探索，值得被记录</p><p>点击画面上方的相机按钮，保存演示画面信息。<br>真实截图与视频将在视频流接入后提供。</p></div>`; else captures.forEach(item => { const row = document.createElement('div'); row.className = 'media-item'; row.textContent = `${item.time} · ${item.scene} · ${item.weather}（演示信息）`; content.append(row); }); }
-  if (type === 'help') { $('#modal-title').textContent = '开始你的第一次探索'; content.innerHTML = '<p>01 &nbsp; 在右侧选择环境与天气；列表支持滚动，使用 + / − 添加或移除选项。</p><p>02 &nbsp; 在画面下方输入自然语言任务，按 Enter 或点击发送。</p><p>03 &nbsp; 画面仅展示原始内容，相机与全屏按钮位于画面上方。</p><p>xpra 模式显示远程 AirSim 窗口，演示模式显示场景图片。天气、场景与飞行指令尚未接入控制接口，不会执行真实飞行指令。任务与媒体信息仅保存在本次会话。</p>'; }
+  if (type === 'help') { $('#modal-title').textContent = '开始你的第一次探索'; content.innerHTML = '<p>01 &nbsp; 天气固定为晴朗、雨天、雾天、雪天，点击后应用至 AirSim；仅环境列表支持 + / −。</p><p>02 &nbsp; 在画面下方输入自然语言任务，按 Enter 或点击发送。</p><p>03 &nbsp; 画面仅展示原始内容，相机与全屏按钮位于画面上方。</p><p>xpra 模式显示远程 AirSim 窗口，演示模式显示场景图片。天气已接入 AirSim RPC；场景与飞行指令尚未接入，不会执行真实飞行指令。任务与媒体信息仅保存在本次会话。</p>'; }
   if (type === 'settings') { $('#modal-title').textContent = '控制台设置'; content.innerHTML = '<p>AEROLYTE CONSOLE · v0.1</p><p>环境：本地控制台<br>画面源：xpra 网页嵌入<br>控制模式：自然语言指令<br>显示单位：米 / 米每秒</p><button class="modal-action" id="configure-connection">配置 xpra 画面连接</button>'; $('#configure-connection').addEventListener('click', () => openModal('connect')); }
   if (!modal.open) modal.showModal();
 }

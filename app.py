@@ -4,16 +4,27 @@ import argparse
 import os
 from urllib.parse import parse_qsl, urlsplit
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
+
+from weather_service import AirSimWeatherService, WEATHER_PRESETS, WeatherBusy, WeatherUnavailable
 
 
 def create_app(test_config=None):
     app = Flask(__name__)
     app.config.from_mapping(
         XPRA_URL=os.environ.get("XPRA_URL", "http://172.27.137.174:10000/"),
+        AIRSIM_HOST=os.environ.get("AIRSIM_HOST", "127.0.0.1"),
+        AIRSIM_PORT=int(os.environ.get("AIRSIM_PORT", "41451")),
+        AIRSIM_TIMEOUT=float(os.environ.get("AIRSIM_TIMEOUT", "5")),
     )
     if test_config:
         app.config.update(test_config)
+
+    if not 1 <= app.config["AIRSIM_PORT"] <= 65535 or not 0 < app.config["AIRSIM_TIMEOUT"] <= 30:
+        raise ValueError("Invalid AIRSIM_PORT or AIRSIM_TIMEOUT (0 < timeout <= 30)")
+    app.extensions["weather_service"] = AirSimWeatherService(
+        app.config["AIRSIM_HOST"], app.config["AIRSIM_PORT"], app.config["AIRSIM_TIMEOUT"]
+    )
 
     url = urlsplit(app.config["XPRA_URL"])
     if url.scheme not in ("http", "https") or not url.hostname:
@@ -39,7 +50,23 @@ def create_app(test_config=None):
             xpra_url=app.config["XPRA_URL"],
             display_mode="xpra-iframe",
             flight_control_available=False,
+            weather_control_available=True,
         )
+
+    @app.post("/api/weather")
+    def set_weather():
+        payload = request.get_json(silent=True)
+        weather = payload.get("weather") if isinstance(payload, dict) else None
+        if not isinstance(weather, str) or weather not in WEATHER_PRESETS:
+            return jsonify(error="invalid_weather", message="请选择晴朗、雨天、雾天或雪天"), 400
+        try:
+            app.extensions["weather_service"].apply(weather)
+        except WeatherBusy as error:
+            return jsonify(error="weather_busy", message=str(error)), 409
+        except WeatherUnavailable as error:
+            app.logger.warning("Weather RPC failed: %s", error)
+            return jsonify(error="airsim_unavailable", message=str(error)), 503
+        return jsonify(weather=weather, status="applied")
 
     @app.errorhandler(404)
     def not_found(error):
