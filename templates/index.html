@@ -22,24 +22,15 @@
   </aside>
 
   <div class="app-shell">
-    <header class="topbar">
-      <div class="wordmark">AEROLYTE<span>飞行，无限可能</span></div>
-      <nav class="topnav"><span class="nav-current">飞行控制台</span><span class="nav-slash">/</span><span>工作空间 01</span></nav>
-      <div class="top-actions"><span class="demo-badge"><span class="dot"></span>模拟环境</span><span class="top-divider"></span><button class="icon-button" data-icon="settings" data-modal="settings" title="设置" aria-label="设置"></button></div>
-    </header>
-
     <main>
-      <section class="page-heading">
-        <div><div class="eyebrow">YOUR SKY. YOUR COMMAND.</div><h1>让探索，从此刻起飞<span>↗</span></h1><p>连接你的无人机，用自然语言开启下一次飞行。</p></div>
-        <button class="outline-button" id="connect"><span data-icon="link"></span><span id="connect-label">连接 AirSim</span><span class="small-arrow">↗</span></button>
-      </section>
+      <div class="console-toolbar"><button class="outline-button" id="connect"><span data-icon="link"></span><span id="connect-label">连接 AirSim</span><span class="small-arrow">↗</span></button></div>
 
       <div class="workspace">
         <div class="flight-column">
           <section class="viewport-card" aria-label="无人机模拟画面">
             <div class="viewport-top"><div class="view-label"><span class="dot"></span>飞行视窗<span class="subtle">/</span><span class="camera-label">FPV CAMERA</span></div><div class="external-view-actions"><span class="preview-label" id="view-mode-label">xpra 远程窗口</span><button class="icon-button" id="capture" data-icon="camera" title="保存演示画面信息" aria-label="保存演示画面信息"></button><button class="icon-button" id="fullscreen" data-icon="expand" title="全屏画面" aria-label="全屏画面"></button></div></div>
-            <div class="viewport" id="viewport" data-scene="mountain"><div class="landscape" role="img" aria-label="山地探索原始演示画面"></div><iframe id="xpra-frame" title="AirSim xpra 远程画面" allow="fullscreen" referrerpolicy="no-referrer" hidden></iframe></div>
-            <div class="viewport-footer"><span><span class="dot muted-dot"></span><span id="feed-status" role="status">等待打开 xpra 客户端</span></span><div class="feed-actions"><button id="retry-feed">重试</button><a id="open-feed" target="_blank" rel="noopener noreferrer">独立打开 ↗</a><button id="disconnect-feed">返回演示</button></div></div>
+            <div class="viewport" id="viewport" data-scene="mountain"><div class="landscape" role="img" aria-label="山地探索原始演示画面"></div><iframe id="xpra-frame" tabindex="0" title="AirSim xpra 远程画面" allow="fullscreen" referrerpolicy="no-referrer" hidden></iframe></div>
+            <div class="viewport-footer"><span><span class="dot muted-dot"></span><span id="feed-status" role="status">等待打开 xpra 客户端</span></span><div class="feed-actions"><button id="focus-feed" title="返回画面接收键盘输入；鼠标视角请点击画面">恢复控制</button><button id="retry-feed">重试</button><a id="open-feed" target="_blank" rel="noopener noreferrer">独立打开 ↗</a><button id="disconnect-feed">返回演示</button></div></div>
           </section>
 
           <section class="command-card">

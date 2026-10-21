@@ -41,3 +41,8 @@
 #xpra-frame{display:block;position:absolute;inset:0;width:100%;height:100%;border:0;background:#101415}#xpra-frame[hidden]{display:none}.remote-mode .landscape{display:none}.feed-actions{display:flex;align-items:center;gap:12px;flex-shrink:0}.feed-actions[hidden]{display:none}.feed-actions button,.feed-actions a{color:#9eb9a8;font-size:9px;text-decoration:none;padding:5px 0}.feed-actions button:hover,.feed-actions a:hover{color:var(--mint)}.viewport-footer{gap:10px}.viewport-footer>span:first-child{min-width:0}.viewport-footer #feed-status{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@media(max-width:560px){.feed-actions{gap:7px}.feed-actions button,.feed-actions a{font-size:8px}.viewport-footer{flex-wrap:wrap;height:auto;min-height:48px;padding-top:5px;padding-bottom:5px;gap:3px}.viewport-footer>span:first-child{flex-basis:100%}}
 
 .weather-status{flex-shrink:0;font-size:10px;line-height:1.7;margin:14px 0 0;color:#839b8b;overflow-wrap:anywhere}.weather-status[data-state=success]{color:var(--mint)}.weather-status[data-state=error]{color:#e6a391}.weather-status[data-state=pending]{color:#c8d3a1}#weather-list .option-button:disabled{opacity:.55;cursor:wait}#weather-list .option-button:disabled:hover{color:inherit}
+
+/* Compact connection toolbar; the workspace starts without the promotional header. */
+.console-toolbar{display:flex;justify-content:flex-end;margin-bottom:16px}
+#xpra-frame:focus-visible{outline:2px solid var(--mint);outline-offset:-2px}
+@media(max-width:560px){main{padding-top:16px}.console-toolbar{margin-bottom:12px}}

@@ -17,6 +17,14 @@ class FlaskConsoleTests(unittest.TestCase):
         self.assertIn('data-xpra-url="http://example.test:10000/"', html)
         self.assertNotIn('{{', html)
 
+    def test_compact_console_preserves_controls_without_promotional_header(self):
+        html = self.client.get('/').get_data(as_text=True)
+        for text in ['飞行，无限可能', '工作空间 01', '模拟环境', 'YOUR SKY. YOUR COMMAND.', '让探索，从此刻起飞', '连接你的无人机，用自然语言开启下一次飞行。']:
+            self.assertNotIn(text, html)
+        self.assertIn('id="connect"', html)
+        self.assertIn('id="focus-feed"', html)
+        self.assertIn('id="xpra-frame" tabindex="0"', html)
+
     def test_static_resources(self):
         for path, mime in [("/static/app.js", "javascript"), ("/static/styles.css", "text/css")]:
             with self.subTest(path=path):

@@ -83,6 +83,14 @@ AIRSIM_HOST=127.0.0.1 AIRSIM_PORT=41451 \
 
 **新打开或刷新另一个页面会再次应用晴朗。** 天气属于同一 AirSim 实例的全局状态，因此会影响其他正在查看该实例的客户端。当前不读取模拟器天气，也不跨浏览器同步选中状态。
 
+## 切换天气后的键盘与鼠标输入
+
+手动点击天气按钮后，控制台会在请求结束时将输入焦点返回 AirSim iframe，成功与失败都会处理，且不会重载画面连接。若等待期间正在输入飞行指令或操作其他控件，则保留当前焦点；首次自动应用晴朗也不抢占焦点。
+
+画面下方的“恢复控制”可手动将键盘焦点返回 AirSim。鼠标视角的捕获受浏览器与模拟器限制，需要点击 AirSim 画面重新进入；键盘焦点恢复不等于自动恢复鼠标锁定。xpra 的 `keyboard=false` 仅隐藏屏幕虚拟键盘，不会禁用实体键盘。
+
+页面已移除顶部品牌宣传、工作空间导航、模拟环境标记和宣传标题，保留连接设置及实际操作区。
+
 ## 天气接口与排查
 
 `POST /api/weather` 接收固定天气标识：`clear`、`rain`、`fog`、`snow`。每次切换会启用天气并写入全部 8 项参数，包含用于清除旧效果的零值。页面仅在收到成功响应后更新选中状态。
@@ -123,7 +131,7 @@ node --test tests/test_frontend.cjs
 node --check static/app.js
 ```
 
-测试覆盖参数下发、无效输入、并发与异常处理，**使用模拟 RPC 响应，不能代替服务器实机验证**。前端测试直接运行实际 `static/app.js`，模拟 DOM 和接口，覆盖默认晴朗、连接恢复、失败重试与保留手动天气；不能代替真实浏览器渲染验证。后端仅依赖 Flask 与 msgpack，不需要安装 AirSim Python SDK。演示图片和字体分别来自 Unsplash、Google Fonts，需联网加载。
+测试覆盖参数下发、无效输入、并发与异常处理，**使用模拟 RPC 响应，不能代替服务器实机验证**。前端测试直接运行实际 `static/app.js`，模拟 DOM 和接口，覆盖默认晴朗、连接恢复、失败重试、保留手动天气、天气切换后的焦点恢复及避免打断输入；不能代替真实浏览器渲染验证。后端仅依赖 Flask 与 msgpack，不需要安装 AirSim Python SDK。演示图片和字体分别来自 Unsplash、Google Fonts，需联网加载。
 
 参考：[AirSim Python API](https://github.com/microsoft/AirSim/blob/main/PythonClient/airsim/client.py) · [xpra HTML5 配置](https://github.com/Xpra-org/xpra-html5/blob/master/docs/Configuration.md)
 
@@ -133,5 +141,5 @@ node --check static/app.js
 - 控制台：`http://172.27.137.174:5173/`；应用画面：`http://172.27.137.174:10000/`。
 - 复用既有 xpra `:100` / AirSimNH 进程；确认窗口标题为 `AirSimNH (64-bit Development SF_VULKAN_SM5)`，xpra 允许控制台嵌入并已启用共享。
 - Flask 在后台运行，日志为 `.venv/console.log`，PID 为 `.venv/console.pid`；没有配置开机启动。
-- 四组天气预设均经真实 RPC 返回成功，结果在 `.venv/integration-results.json`；12 项 Python 测试及 4 项前端回归测试通过。Python 测试日志在 `.venv/tests.log`。
+- 四组天气预设均经真实 RPC 返回成功，结果在 `.venv/integration-results.json`；13 项 Python 测试及 8 项前端回归测试通过。Python 测试日志在 `.venv/tests.log`。
 - 浏览器自动化读取页面及截图超时，因此尚未完成嵌入画面、天气视觉效果和按钮交互的浏览器验收。HTTP 成功与 RPC 成功不能代替视觉验收。

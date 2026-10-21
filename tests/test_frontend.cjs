@@ -7,10 +7,11 @@ const source = readFileSync(require('node:path').join(__dirname, '../static/app.
 function consolePage({connected = true, weatherOk = true} = {}) {
   const elements = new Map();
   function element() {
-    return {dataset:{}, classList:{add(){},remove(){}}, scrollTop:0,
+    return {contains(){return false;}, focus(){context.document.activeElement=this; state.focuses++;},
+      contentWindow:{focus(){state.windowFocuses++;}}, dataset:{}, classList:{add(){},remove(){}}, scrollTop:0,
       setAttribute(){},removeAttribute(){},addEventListener(){},append(){},replaceChildren(){}};
   }
-  const state = {connected, weatherOk, requests:[]};
+  const state = {connected, weatherOk, requests:[], focuses:0, windowFocuses:0};
   const context = vm.createContext({
     document: {body:{dataset:{xpraUrl:'http://example.test:10000/'}}, hidden:false,
       querySelector(selector) { if (!elements.has(selector)) elements.set(selector, element()); return elements.get(selector); },
@@ -21,6 +22,7 @@ function consolePage({connected = true, weatherOk = true} = {}) {
     fetch:async (url, options = {}) => {
       const weather = options.body ? JSON.parse(options.body).weather : undefined;
       state.requests.push({url,weather});
+      if (url === '/api/weather' && state.weatherWait) await state.weatherWait;
       const ok = url === '/api/airsim' ? state.connected : state.weatherOk;
       return {ok, json:async () => url === '/api/airsim' ? {connected:ok} : ok ? {status:'applied',weather} : {message:'RPC failed'}};
     }
@@ -70,4 +72,41 @@ test('periodic health checks preserve manually selected rain', async () => {
   await page.run('checkAirSim()');
   assert.equal(page.run('selected.weather'), 'rain');
   assert.equal(page.state.requests.filter(r => r.weather === 'clear').length, 1);
+});
+
+for (const weatherOk of [true, false]) {
+  test(`weather switch returns input to the AirSim iframe (RPC success=${weatherOk})`, async () => {
+    const page = consolePage();
+    await settle();
+    assert.equal(page.state.focuses, 0, 'automatic initialization must not steal focus');
+    const source = page.elements.get('#xpra-frame').src;
+    page.state.weatherOk = weatherOk;
+    page.run('document.activeElement=document.body');
+    await page.run("applyWeather(options.weather.find(item => item.id === 'rain'), true)");
+    assert.equal(page.state.focuses, 1);
+    assert.equal(page.state.windowFocuses, 1);
+    assert.equal(page.run("document.activeElement === $('#xpra-frame')"), true);
+    assert.equal(page.elements.get('#xpra-frame').src, source, 'weather must not reconnect xpra');
+  });
+}
+
+test('a pending weather request does not steal focus from the command input', async () => {
+  const page = consolePage();
+  await settle();
+  let release;
+  page.state.weatherWait = new Promise(resolve => {release=resolve;});
+  const switching = page.run("applyWeather(options.weather.find(item => item.id === 'rain'), true)");
+  page.run("document.activeElement=$('#command')");
+  release();
+  await switching;
+  assert.equal(page.state.focuses, 0);
+  assert.equal(page.run("document.activeElement === $('#command')"), true);
+});
+
+test('resume control returns keyboard focus without restarting the stream', async () => {
+  const page = consolePage();
+  await settle();
+  page.run("document.activeElement=$('#command'); focusAirSim(true)");
+  assert.equal(page.run("document.activeElement === $('#xpra-frame')"), true);
+  assert.equal(page.state.windowFocuses, 1);
 });

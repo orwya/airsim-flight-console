@@ -78,6 +78,18 @@ $('#xpra-frame').addEventListener('load',()=>{
 });
 $('#retry-feed').addEventListener('click',()=>{try {connectXpra(activeXpraUrl,false);} catch(error) {toast(error.message);}});
 $('#disconnect-feed').addEventListener('click',disconnectXpra);
+function focusAirSim(force=false) {
+  if (!remoteActive || modal.open) return;
+  const frame = $('#xpra-frame');
+  const active = document.activeElement;
+  // Do not interrupt typing or another action performed while the RPC was pending.
+  if (!force && active && active !== document.body && active !== frame && !$('#weather-list').contains(active)) return;
+  frame.focus({preventScroll:true});
+  // Window.focus is permitted for a cross-origin iframe; do not inspect its DOM.
+  frame.contentWindow?.focus();
+}
+$('#focus-feed').addEventListener('click', () => focusAirSim(true));
+
 const options = {
   scene: [{id:'mountain', name:'山地探索', detail:'Alpine Valley', preset:'mountain'}, {id:'city', name:'城市巡航', detail:'Urban District', preset:'city'}, {id:'coast', name:'海岸漫游', detail:'Coastal Escape', preset:'coast'}],
   weather: Object.freeze([{id:'clear', name:'晴朗', detail:'Clear skies', preset:'sun'}, {id:'rain', name:'雨天', detail:'Rain', preset:'rain'}, {id:'fog', name:'雾天', detail:'Fog', preset:'fog'}, {id:'snow', name:'雪天', detail:'Snow', preset:'snow'}])
@@ -105,7 +117,7 @@ function renderList(type) {
     const indicator=document.createElement('span'); indicator.className='selection-indicator';
     button.append(thumb,label,indicator);
     button.addEventListener('click',()=>{
-      if(type==='weather') {applyWeather(item); return;}
+      if(type==='weather') {applyWeather(item, true); return;}
       selected[type]=item.id;
       if(type==='scene') {viewport.dataset.scene=item.preset; $('.landscape').setAttribute('aria-label',item.name+'原始演示画面'); if(remoteActive) toast('场景选择仅记录在界面中，远程 AirSim 场景切换接口待接入');}
       const position=list.scrollTop; renderList(type); list.scrollTop=position;
@@ -115,7 +127,7 @@ function renderList(type) {
   $('#'+type+'-count').textContent=String(options[type].length).padStart(2,'0')+' 项';
   if(type==='scene') document.querySelector('[data-remove="scene"]').disabled=options.scene.length<=1;
 }
-async function applyWeather(item) {
+async function applyWeather(item, restoreInput=false) {
   if(weatherPending) return;
   weatherPending=true;
   const list=$('#weather-list'); const position=list.scrollTop;
@@ -138,6 +150,7 @@ async function applyWeather(item) {
     status.textContent=message; status.dataset.state='error'; toast(message);
   } finally {
     clearTimeout(timer); weatherPending=false; list.setAttribute('aria-busy','false'); renderList('weather'); list.scrollTop=position;
+    if (restoreInput) focusAirSim();
   }
 }
 renderList('scene'); renderList('weather');
