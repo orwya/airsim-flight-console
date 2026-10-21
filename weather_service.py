@@ -4,6 +4,8 @@ Uses the same RPC calls and WeatherParameter enum as the official AirSim SDK,
 without requiring its legacy Tornado / NumPy dependency stack.
 """
 
+from contextlib import contextmanager
+
 import socket
 import threading
 import time
@@ -29,12 +31,11 @@ class AirSimWeatherService:
         self.host, self.port, self.timeout = host, port, timeout
         self.lock = threading.Lock()
 
-    def apply(self, weather):
-        # Serializing a full preset prevents concurrent requests mixing effects.
-        if not self.lock.acquire(blocking=False):
-            raise WeatherBusy("正在切换天气，请稍后重试")
+    @contextmanager
+    def _rpc(self):
+        """One bounded RPC connection, shared by read-only probes and presets."""
+        deadline = time.monotonic() + self.timeout
         try:
-            deadline = time.monotonic() + self.timeout
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as connection:
                 unpacker = msgpack.Unpacker(raw=False, max_buffer_size=1024 * 1024)
                 request_id = 0
@@ -42,14 +43,17 @@ class AirSimWeatherService:
                 def call(method, *args):
                     nonlocal request_id
                     request_id += 1
-                    connection.settimeout(max(0.001, deadline - time.monotonic()))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError()
+                    connection.settimeout(remaining)
                     connection.sendall(msgpack.packb([0, request_id, method, list(args)], use_bin_type=True))
                     while True:
                         for response in unpacker:
                             if not isinstance(response, list) or len(response) != 4 or response[0] != 1 or response[1] != request_id:
                                 raise WeatherUnavailable("AirSim RPC 返回了无效响应")
                             if response[2] is not None:
-                                raise WeatherUnavailable("AirSim 拒绝天气设置，请检查模拟器日志与天气支持")
+                                raise WeatherUnavailable("AirSim 拒绝 RPC 调用，请检查模拟器日志与接口支持")
                             return response[3]
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -60,13 +64,26 @@ class AirSimWeatherService:
                             raise WeatherUnavailable("AirSim RPC 连接已断开")
                         unpacker.feed(data)
 
+                yield call
+        except (OSError, ValueError, msgpack.UnpackException) as error:
+            raise WeatherUnavailable("AirSim RPC 连接失败，请检查模拟器及 RPC 地址、端口；若天气部分生效，请重试完整预设") from error
+
+    def probe(self):
+        """Verify RPC availability without changing the simulation."""
+        with self._rpc() as call:
+            if call("ping") is not True:
+                raise WeatherUnavailable("AirSim 未确认连接")
+
+    def apply(self, weather):
+        if not self.lock.acquire(blocking=False):
+            raise WeatherBusy("正在切换天气，请稍后重试")
+        try:
+            with self._rpc() as call:
                 if call("ping") is not True:
                     raise WeatherUnavailable("AirSim 未确认连接")
                 call("simEnableWeather", True)
                 for name, value in WEATHER_PRESETS[weather].items():
                     call("simSetWeatherParameter", PARAMETER_IDS[name], float(value))
-        except (OSError, ValueError, msgpack.UnpackException) as error:
-            raise WeatherUnavailable("无法完成天气切换，请检查 AirSim RPC 地址、端口及模拟器状态；若部分参数已生效，请重试完整预设") from error
         finally:
             self.lock.release()
 

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#101415" />
-  <meta name="description" content="AEROLYTE 无人机智能飞行控制台 UI 演示" />
+  <meta name="description" content="AirSim 应用窗口与实时天气控制台" />
   <title>AEROLYTE · 智能飞行控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
@@ -63,7 +63,8 @@
             <p class="panel-description">选择天气，实时应用至 AirSim。</p>
             <div class="list-summary"><span>天气列表</span><span id="weather-count"></span></div>
             <div class="option-list" id="weather-list" role="group" aria-label="天气列表" tabindex="0"></div>
-            <p id="weather-status" class="weather-status" role="status">尚未设置天气</p>
+            <p id="airsim-status" class="weather-status" role="status">正在检查 AirSim RPC…</p>
+            <p id="weather-status" class="weather-status" role="status">等待连接后应用默认天气：晴朗</p>
           </section>
         </aside>
       </div>

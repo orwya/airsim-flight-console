@@ -84,6 +84,7 @@ const options = {
 };
 const selected = {scene:'mountain', weather:null};
 let weatherPending = false;
+let weatherInitialized = false;
 function renderList(type) {
   const list = $('#'+type+'-list');
   list.replaceChildren();
@@ -128,6 +129,7 @@ async function applyWeather(item) {
     const result=await response.json();
     if(!response.ok || result.status!=='applied' || result.weather!==item.id) throw new Error(result.message || '天气切换失败，请检查 AirSim 连接');
     selected.weather=item.id;
+    weatherInitialized=true;
     status.textContent='已应用：'+item.name; status.dataset.state='success';
     toast('已将 AirSim 天气切换为「'+item.name+'」');
   } catch(error) {
@@ -177,7 +179,7 @@ function openModal(type) {
   }
   if (type === 'connect') {
     $('#modal-title').textContent='连接 AirSim 画面';
-    content.innerHTML='<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接仅用于显示，飞行指令与环境控制仍需独立接口。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>';
+    content.innerHTML='<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接用于显示 AirSim 应用窗口；右侧天气按钮通过 RPC 独立控制天气。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>';
     $('#console-origin').textContent=location.origin;
     let saved=''; try {saved=localStorage.getItem('aerolyte-xpra-url') || '';} catch {}
     $('#endpoint').value=activeXpraUrl || saved || DEFAULT_XPRA_URL;
@@ -197,3 +199,32 @@ modal.addEventListener('click', e => { if (e.target === modal) { const r = modal
 let initialXpraUrl=DEFAULT_XPRA_URL;
 try {initialXpraUrl=localStorage.getItem('aerolyte-xpra-url') || DEFAULT_XPRA_URL;} catch {}
 try {connectXpra(initialXpraUrl,false);} catch(error) {disconnectXpra();toast(error.message);}
+
+// The probe is read-only. First successful connection initializes clear weather once per page.
+let rpcCheckPending = false;
+async function checkAirSim() {
+  if (rpcCheckPending || document.hidden || weatherPending) return;
+  rpcCheckPending = true;
+  const status = $('#airsim-status');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35000);
+  try {
+    const response = await fetch('/api/airsim', {signal: controller.signal, cache: 'no-store'});
+    const result = await response.json();
+    if (!response.ok || result.connected !== true) throw new Error(result.message || 'AirSim RPC 未连接');
+    status.textContent = 'AirSim RPC 已连接 · 可切换天气';
+    status.dataset.state = 'success';
+    if (!weatherInitialized && !weatherPending) {
+      await applyWeather(options.weather.find(item => item.id === 'clear'));
+    }
+  } catch (error) {
+    status.textContent = error.name === 'AbortError' ? 'AirSim RPC 检查超时' : 'AirSim RPC 未连接，请检查模拟器';
+    status.dataset.state = 'error';
+  } finally {
+    clearTimeout(timer);
+    rpcCheckPending = false;
+  }
+}
+checkAirSim();
+setInterval(checkAirSim, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAirSim(); });

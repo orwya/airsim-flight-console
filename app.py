@@ -53,6 +53,14 @@ def create_app(test_config=None):
             weather_control_available=True,
         )
 
+    @app.get("/api/airsim")
+    def airsim_status():
+        try:
+            app.extensions["weather_service"].probe()
+        except WeatherUnavailable as error:
+            return jsonify(connected=False, message=str(error)), 503
+        return jsonify(connected=True, message="AirSim RPC 已连接")
+
     @app.post("/api/weather")
     def set_weather():
         payload = request.get_json(silent=True)

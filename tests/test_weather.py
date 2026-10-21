@@ -86,6 +86,21 @@ class WeatherTests(unittest.TestCase):
             service.lock.release()
         self.assertEqual(response.status_code, 409)
 
+    def test_status_probe_only_pings_and_never_changes_weather(self):
+        connection = RpcConnection()
+        with patch('weather_service.socket.create_connection', return_value=connection):
+            response = self.client.get('/api/airsim')
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['connected'])
+        self.assertEqual([(r[2], r[3]) for r in connection.requests], [('ping', [])])
+
+    def test_status_reports_rpc_failure(self):
+        for connection in [RpcConnection(timeout=True), RpcConnection(error_at=1)]:
+            with self.subTest(connection=connection), patch('weather_service.socket.create_connection', return_value=connection):
+                response = self.client.get('/api/airsim')
+            self.assertEqual(response.status_code, 503)
+            self.assertFalse(response.json['connected'])
+
     def test_configuration_and_fixed_weather_ui(self):
         app = create_app({"TESTING": True, "AIRSIM_HOST": "example.test", "AIRSIM_PORT": 4242})
         service = app.extensions['weather_service']
