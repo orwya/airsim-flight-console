@@ -2,8 +2,6 @@ const icons = {
   dashboard:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   route:'<circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M7 5h8a4 4 0 0 1 0 8H9a4 4 0 0 0 0 8h5"/>',
   folder:'<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/>',
-  help:'<circle cx="12" cy="12" r="9"/><path d="M9 9a3 3 0 1 1 4 3c-1 .5-1 1-1 2m0 3h.01"/>',
-  settings:'<path d="m9 3-1 3-3 1 1 3-2 2 2 2-1 3 3 1 1 3h6l1-3 3-1-1-3 2-2-2-2 1-3-3-1-1-3Z"/><circle cx="12" cy="12" r="3"/>',
   link:'<path d="m10 7 2-2a5 5 0 0 1 7 7l-2 2m-3 3-2 2a5 5 0 0 1-7-7l2-2m2 5 6-6"/>',
   signal:'<path d="M4 20v-3m5 3v-7m5 7V9m5 11V4"/>',
   navigation:'<path d="m12 3 8 18-8-4-8 4Z"/>',
@@ -200,8 +198,6 @@ function openModal(type) {
   }
   if (type === 'missions') { $('#modal-title').textContent = '任务记录'; content.replaceChildren(); if (!history.length) content.innerHTML = `<div class="empty-state">${icon('route')}<p>还没有飞行指令</p><p>在控制台输入任务，指令记录将显示在这里。</p></div>`; else history.forEach(item => { const row = document.createElement('div'); row.className = 'media-item'; row.textContent = `${item.time} · ${item.command} · 未执行（演示）`; content.append(row); }); }
   if (type === 'media') { $('#modal-title').textContent = '媒体库'; content.replaceChildren(); if (!captures.length) content.innerHTML = `<div class="empty-state">${icon('camera')}<p>你的探索，值得被记录</p><p>点击画面上方的相机按钮，保存演示画面信息。<br>真实截图与视频将在视频流接入后提供。</p></div>`; else captures.forEach(item => { const row = document.createElement('div'); row.className = 'media-item'; row.textContent = `${item.time} · ${item.scene} · ${item.weather}（演示信息）`; content.append(row); }); }
-  if (type === 'help') { $('#modal-title').textContent = '开始你的第一次探索'; content.innerHTML = '<p>01 &nbsp; 天气固定为晴朗、雨天、雾天、雪天，点击后应用至 AirSim；仅环境列表支持 + / −。</p><p>02 &nbsp; 在画面下方输入自然语言任务，按 Enter 或点击发送。</p><p>03 &nbsp; 画面仅展示原始内容，相机与全屏按钮位于画面上方。</p><p>xpra 模式显示远程 AirSim 窗口，演示模式显示场景图片。天气已接入 AirSim RPC；场景与飞行指令尚未接入，不会执行真实飞行指令。任务与媒体信息仅保存在本次会话。</p>'; }
-  if (type === 'settings') { $('#modal-title').textContent = '控制台设置'; content.innerHTML = '<p>AEROLYTE CONSOLE · v0.1</p><p>环境：本地控制台<br>画面源：xpra 网页嵌入<br>控制模式：自然语言指令<br>显示单位：米 / 米每秒</p><button class="modal-action" id="configure-connection">配置 xpra 画面连接</button>'; $('#configure-connection').addEventListener('click', () => openModal('connect')); }
   if (!modal.open) modal.showModal();
 }
 $('#connect').addEventListener('click', () => openModal('connect'));

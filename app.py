@@ -1,4 +1,4 @@
-"""Flask entry point for the AEROLYTE console."""
+"""Flask entry point for the AirSim Flight Console."""
 
 import argparse
 import os
@@ -91,7 +91,7 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AEROLYTE Flask console")
+    parser = argparse.ArgumentParser(description="AirSim Flight Console")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5173)
     args = parser.parse_args()

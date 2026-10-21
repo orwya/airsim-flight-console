@@ -5,20 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#101415" />
   <meta name="description" content="AirSim 应用窗口与实时天气控制台" />
-  <title>AEROLYTE · 智能飞行控制台</title>
+  <title>AirSim 飞行控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body data-xpra-url="{{ xpra_url }}">
   <aside class="rail">
-    <div class="brand-mark" role="img" aria-label="AEROLYTE 标志"><svg viewBox="0 0 32 32"><path d="M4 25 16 5l12 20-12-6Z"/><path d="m16 19 0 8"/></svg></div>
-    <div class="rail-line"></div>
     <button class="rail-button active" data-icon="dashboard" aria-label="飞行控制台" title="飞行控制台"></button>
     <button class="rail-button" data-icon="route" data-modal="missions" aria-label="任务记录" title="任务记录"></button>
     <button class="rail-button" data-icon="folder" data-modal="media" aria-label="媒体库" title="媒体库"></button>
-    <div class="rail-bottom">
-      <button class="rail-button" data-icon="help" data-modal="help" aria-label="使用帮助" title="使用帮助"></button>
-      <button class="avatar" data-modal="settings" title="控制台设置" aria-label="控制台设置">A</button>
-    </div>
   </aside>
 
   <div class="app-shell">
@@ -39,7 +33,7 @@
             <div class="suggestions"><span>试一试</span><button data-command="起飞并上升至 20 米">↗ 起飞至 20m</button><button data-command="环绕当前目标飞行一周">◎ 环绕飞行</button><button data-command="返回起飞点并降落">⌂ 返航降落</button></div>
             <div class="command-feedback" id="command-feedback" role="status"></div>
           </section>
-          <div class="bottom-note"><span data-icon="shield"></span>每一次探索，都从安全出发。<span>飞行指令接口待接入，当前仅展示远程窗口。</span><span class="version">AEROLYTE CONSOLE <b>v0.1</b></span></div>
+          <div class="bottom-note"><span data-icon="shield"></span>每一次探索，都从安全出发。<span>飞行指令接口待接入，当前仅展示远程窗口。</span></div>
         </div>
 
         <aside class="control-column">
