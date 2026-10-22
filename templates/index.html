@@ -8,7 +8,7 @@
   <title>AirSim 飞行控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
-<body data-xpra-url="{{ xpra_url }}">
+<body data-xpra-url="{{ xpra_url }}" data-scene-control="{{ 'true' if scene_control else 'false' }}">
   <aside class="rail">
     <button class="rail-button active" data-icon="dashboard" aria-label="飞行控制台" title="飞行控制台"></button>
     <button class="rail-button" data-icon="route" data-modal="missions" aria-label="任务记录" title="任务记录"></button>
@@ -23,8 +23,8 @@
         <div class="flight-column">
           <section class="viewport-card" aria-label="无人机模拟画面">
             <div class="viewport-top"><div class="view-label"><span class="dot"></span>飞行视窗<span class="subtle">/</span><span class="camera-label">FPV CAMERA</span></div><div class="external-view-actions"><span class="preview-label" id="view-mode-label">xpra 远程窗口</span><button class="icon-button" id="capture" data-icon="camera" title="保存演示画面信息" aria-label="保存演示画面信息"></button><button class="icon-button" id="fullscreen" data-icon="expand" title="全屏画面" aria-label="全屏画面"></button></div></div>
-            <div class="viewport" id="viewport" data-scene="mountain"><div class="landscape" role="img" aria-label="山地探索原始演示画面"></div><iframe id="xpra-frame" tabindex="0" title="AirSim xpra 远程画面" allow="fullscreen" referrerpolicy="no-referrer" hidden></iframe></div>
-            <div class="viewport-footer"><span><span class="dot muted-dot"></span><span id="feed-status" role="status">等待打开 xpra 客户端</span></span><div class="feed-actions"><button id="focus-feed" title="返回画面接收键盘输入；鼠标视角请点击画面">恢复控制</button><button id="retry-feed">重试</button><a id="open-feed" target="_blank" rel="noopener noreferrer">独立打开 ↗</a><button id="disconnect-feed">返回演示</button></div></div>
+            <div class="viewport" id="viewport" data-scene="mountain"><div class="landscape" role="img" aria-label="等待连接 AirSim 画面"></div><iframe id="xpra-frame" tabindex="0" title="AirSim xpra 远程画面" allow="fullscreen" referrerpolicy="no-referrer" hidden></iframe><div id="scene-overlay" class="scene-overlay" hidden><span id="scene-overlay-text">请选择场景启动</span></div></div>
+            <div class="viewport-footer"><span><span class="dot muted-dot"></span><span id="feed-status" role="status">等待打开 xpra 客户端</span></span><div class="feed-actions"><button id="focus-feed" title="返回画面接收键盘输入；鼠标视角请点击画面">恢复控制</button><button id="retry-feed">重试</button><a id="open-feed" target="_blank" rel="noopener noreferrer">独立打开 ↗</a><button id="disconnect-feed">断开画面</button></div></div>
           </section>
 
           <section class="command-card">
@@ -38,10 +38,12 @@
 
         <aside class="control-column">
           <section class="panel environment-panel option-panel">
-            <div class="section-title"><h2>环境控制</h2><div class="list-actions"><button data-remove="scene" aria-label="移除当前环境" title="移除当前环境">−</button><button data-add="scene" aria-label="添加环境" title="添加环境">+</button></div></div>
-            <p class="panel-description">选择一个世界，开启下一次探索。</p>
+            <div class="section-title"><h2>环境控制</h2></div>
+            <p class="panel-description">选择环境，后台将停止旧场景并启动目标场景。</p>
             <div class="list-summary"><span>场景列表</span><span id="scene-count"></span></div>
             <div class="option-list" id="scene-list" role="group" aria-label="环境列表" tabindex="0"></div>
+            <p id="scene-status" class="weather-status" role="status">正在读取场景状态…</p>
+            <button id="cleanup-scene" class="scene-cleanup">停止并清理</button>
           </section>
           <section class="panel weather-panel option-panel">
             <div class="section-title"><h2>天气条件</h2></div>
@@ -59,6 +61,6 @@
   <dialog id="modal"><div class="modal-top"><h2 id="modal-title"></h2><button class="icon-button" id="close-modal" data-icon="close" aria-label="关闭弹窗"></button></div><div id="modal-content"></div></dialog>
   <div id="toast" class="toast" role="status"></div>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='scenes.js') }}"></script>
 </body>
 </html>
-

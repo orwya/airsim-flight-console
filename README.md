@@ -1,145 +1,166 @@
 # AirSim Flight Console
 
-基于 Flask 的 AirSim 网页控制台，使用原生 HTML、CSS 和 JavaScript 构建界面。通过 xpra 嵌入 AirSim 应用窗口，并通过独立的 AirSim RPC 接口发送天气设置。
+基于 Flask 的 AirSim 网页控制台。通过 xpra 显示应用窗口，通过 MessagePack RPC 修改天气，并在网页中启动、切换、停止三个固定环境。
 
-## 当前状态
+## 已实现
 
-- **界面与画面接入**：包含指令输入、环境列表、固定天气列表及 xpra 连接入口。多客户端访问需要 xpra 开启共享。
-- **默认天气**：每次新打开或刷新页面，首次 RPC 连接成功后自动应用晴朗，并在成功后选中“晴朗”。连接失败时等待重试；初始化完成后的定时检查不会覆盖手动选择。
-- **天气控制**：已实现晴朗、雨天、雾天、雪天四组预设及 Flask 接口；2026-10-21 在服务器上通过真实 AirSim RPC 验证了全部四组预设（HTTP 200），测试结束恢复晴朗。视觉效果仍需在浏览器确认。
-- **待实现**：自然语言飞行任务、场景切换、真实截图和独立无人机相机视频流。当前飞行指令仅在浏览器会话内记录，不会控制无人机。
+- 固定环境：AirSimNH、AbandonedPark、MSBuild2018。环境列表不再是演示，已移除增删入口。
+- 点击环境后异步执行：停止旧 xpra/AirSim → 等端口释放 → 启动目标会话 → 确认目标窗口与 RPC → 初始化晴朗。
+- 提供切换阶段、错误和“停止并清理”；切换中遮罩画面并关闭天气写入。再次选择已就绪的同一场景不重启。
+- 晴朗、雨天、雾天、雪天四组完整预设；请求关联当前实例，拒绝旧实例请求。
+- 天气操作后恢复 iframe 键盘焦点；鼠标视角捕获仍需用户点击画面。
 
-## 连接关系
+自然语言飞行任务、真实截图及独立无人机相机视频流尚未实现。输入的飞行指令只保存在本次浏览器会话，不会执行。
+
+## 连接关系与切换影响
 
 ```text
-浏览器 ── HTTP ── Flask 控制台（5173）
- │                   │
- │ iframe            └── MessagePack RPC ── AirSim（41451）
- └── HTTP/WebSocket ── xpra（10000）── AirSim 应用窗口
+浏览器 ── HTTP :5173 ── Flask 场景管理器
+  │                       ├── RPC :41451 ── AirSim / 天气
+  └── iframe / WS :10000 ── xpra :100 ── AirSim 应用窗口
+planner ── RPC :41451 ───────────────────┘
 ```
 
-三个端口分别用于网页、画面传输、模拟器控制。**xpra 有画面不代表天气 RPC 已连通。** Flask 不代理 xpra 视频，也不启动或停止 AirSim。当前未实现登录鉴权，部署应限制在可信网络中，公网访问需另配认证。
+本实现按“重启整个 xpra 会话”的方案切换，不是运行中的地图热切换。旧实例退出后，飞行位置、控制状态及未保存的仿真状态会重置，网页重新连接画面。所有浏览器共用一个环境；切换会影响其他客户端。
 
-## 在服务器运行
+planner 应在连接中断后重建客户端，等待 `GET /api/status` 的 `phase=ready` 再恢复控制，并重新获取实例相关状态。端口开放不代表初始化结束；Flask 天气门禁不能阻止 planner 直接访问 RPC。
 
-需要 Python 3.10+，以及已启动的 AirSim 和 xpra。以下假设 Flask 与 AirSim 运行在同一台服务器。
+## 服务器条件
 
-首次获取与启动：
+- Linux、Python 3.10+、xpra、Xvfb、ss、bwrap，以及已有 GPU 驱动。
+- 当前服务器 xpra 为 6.5.5；实现使用该版本支持的 `control map/focus`。无浏览器连接时也先显示目标窗口，避免 Vulkan/GameThread 阻塞天气初始化。
+- 三套应用已安装在 `/data/airsim/<环境>/LinuxNoEditor/`。
+- 源 settings 为 `/data/airsim/settings.json`，只读。后端生成项目内 settings 副本，保留原配置并设置 ApiServerPort、RpcEnabled。
+- 三个原始 .sh 脚本包含 chmod。模板直接调用已具备执行权限的二进制，不执行这些脚本、不修改安装目录。
+
+首次启动：
 
 ```bash
-git clone https://github.com/orwya/airsim-flight-console.git
-cd airsim-flight-console
+cd /data/airsim-flight-console
 python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+TMPDIR="$PWD/.venv" PIP_CACHE_DIR="$PWD/.venv/pip-cache" .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python app.py --host 0.0.0.0 --port 5173
 ```
 
-在电脑浏览器打开 `http://服务器IP:5173/`。请确保电脑能访问 Flask 的 5173 端口和 xpra 的 10000 端口。
+浏览器打开 `http://172.27.137.174:5173/`。不再需要先在终端手动启动 xpra；选择环境即启动。当前服务器后台网页日志为 `.venv/console.log`，PID 记录在 `.venv/console.pid`，没有设置开机启动。
 
-已有仓库更新时，在仓库目录执行：
-
-```bash
-git pull --ff-only
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-然后重启 Flask，并在浏览器按 Ctrl+F5 刷新。无需为更新网页而停止 xpra 或 AirSim。
-
-Windows 本地开发可使用 `.venv\Scripts\python.exe` 替代上述 `.venv/bin/python`。内置 Flask 服务用于开发联调；正式部署应使用 WSGI 服务。天气参数的并发锁仅在单进程内生效，部署多个进程前需增加跨进程协调。
+原先手动启动的 xpra/AirSim 不会被自动接管或强杀。若占用显示号或端口，先由操作者停止原会话，再从网页启动；“停止并清理”也不会越过归属检查。
 
 ## 配置
 
-环境变量在启动 Flask 前设置，修改后需重启进程。
+```bash
+.venv/bin/python app.py --host 0.0.0.0 --port 5173 \
+  --display=:100 --tcp-port=10000 --rpc-port=41451 \
+  --settings=/data/airsim/settings.json \
+  --port-release-wait=10 --kill-wait=5 \
+  --tcp-ready-timeout=30 --rpc-ready-timeout=120 --poll-interval=0.2
+```
 
-| 变量 | 默认值 | 说明 |
+| 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `XPRA_URL` | `http://172.27.137.174:10000/` | 浏览器可访问的 xpra 网页地址 |
-| `AIRSIM_HOST` | `127.0.0.1` | Flask 连接的 AirSim RPC 主机 |
-| `AIRSIM_PORT` | `41451` | AirSim RPC TCP 端口 |
-| `AIRSIM_TIMEOUT` | `5` | 单次天气请求的超时秒数，范围 `(0, 30]` |
+| --display | :100 | xpra 显示号 |
+| --tcp-port | 10000 | 画面监听端口 |
+| --rpc-port | 41451 | 生成 settings 和天气服务使用的统一端口 |
+| --port-release-wait | 10 | 停止后等待释放；不是固定睡眠 |
+| --kill-wait | 5 | 受管进程强杀后等待端口释放 |
+| --tcp-ready-timeout | 30 | 画面服务启动上限 |
+| --rpc-ready-timeout | 120 | RPC、归属与应用窗口就绪上限 |
+| --poll-interval | 0.2 | 后端检查间隔 |
+| XPRA_URL | http://172.27.137.174:10000/ | 浏览器可访问的画面地址 |
+| AIRSIM_TIMEOUT | 5 | 普通天气请求超时；新实例初始化单独使用 30 秒 |
 
-例如：
+更改 tcp-port 或浏览器访问主机时，需同时设置对应的 XPRA_URL。浏览器连接设置中保存的地址优先于服务端默认地址。HTTPS 网页需配套 HTTPS/WSS xpra。
 
-```bash
-XPRA_URL=http://172.27.137.174:10000/ \
-AIRSIM_HOST=127.0.0.1 AIRSIM_PORT=41451 \
-.venv/bin/python app.py --host 0.0.0.0 --port 5173
-```
+`python app.py` 自动启用场景管理。导入 `app:app` 默认只启用网页/天气，避免模块导入产生进程控制副作用；WSGI 使用场景管理时需设置 `SCENE_CONTROL_ENABLED=1`，且只允许一个服务进程。不要开启 Flask reloader 或多 worker。生产多进程部署前，应将管理器拆为独立服务。
 
-网页“连接设置”中保存的 xpra 地址优先于 `XPRA_URL`；它不影响天气接口的 `AIRSIM_HOST`。Flask 与 AirSim 不同机时，需配置 RPC 主机地址并确认相应端口可达。
+## 模板与进程边界
 
-### xpra 嵌入与共享
+`scene_launcher.py` 集中维护三个场景名、二进制路径、启动与停止参数。修改后重启后端生效。模板为可信管理员配置，返回 argv 数组，通过 shell=False 执行；浏览器只能提交 scene_id，不能提交任意命令、路径或参数。
 
-- 服务端 CSP 的 `frame-ancestors` 必须允许实际控制台来源，例如 `http://172.27.137.174:5173`。配置为 `*` 会允许任意网络来源嵌入。
-- 多客户端访问时，xpra 启动参数应包含 `--sharing=yes`。网页使用 `sharing=true&steal=true`；若服务端未开启共享，新连接可能替换旧连接。
-- 若提示 `session busy`，先检查运行中会话的共享设置，不要反复启动同一个显示号。支持该命令的版本可执行 `xpra control :100 set-sharing yes`。
-- HTTPS 控制台需配套 HTTPS/WSS 的 xpra 服务。iframe 加载完成不代表远程会话已连接成功。
+停止前检查监听 PID、用户、实际可执行文件、精确显示号及项目运行路径。兼容 xpra 的 setproctitle 表示，不能仅凭命令里出现 :100 就认定归属。控制命令使用项目内 session socket 的明确地址，避免按显示号全局查找而连接其他会话。优先 xpra stop，超时再重新验证进程身份并处理对应进程树。端口归属未知时报告错误，不使用全局 pkill。
 
-## 默认天气与交互
+后端启动时清理确认属于本项目的残留会话；正常退出也执行有界清理。后台线程、天气请求和切换共用操作门禁，项目内 flock 阻止重复管理器。后端被强杀时，残留会话可由下次启动清理。
 
-打开或刷新网页后，控制台检查 AirSim RPC。首次检查成功时自动发送 `clear` 预设，清除全部天气效果；收到成功响应后，“晴朗”按钮显示选中，状态显示“已应用：晴朗”。初始化期间显示等待或切换状态，失败时显示错误并在后续检查中重试，不会提前显示已应用。
+## 项目目录与文件系统隔离
 
-每个页面只完成一次默认初始化。之后点击雨天、雾天、雪天或晴朗即可切换；每 15 秒的连接检查及断线恢复不会重置已成功选择的天气。若初始化前手动选择天气并成功，也以该选择为准。
-
-**新打开或刷新另一个页面会再次应用晴朗。** 天气属于同一 AirSim 实例的全局状态，因此会影响其他正在查看该实例的客户端。当前不读取模拟器天气，也不跨浏览器同步选中状态。
-
-## 切换天气后的键盘与鼠标输入
-
-手动点击天气按钮后，控制台会在请求结束时将输入焦点返回 AirSim iframe，成功与失败都会处理，且不会重载画面连接。若等待期间正在输入飞行指令或操作其他控件，则保留当前焦点；首次自动应用晴朗也不抢占焦点。
-
-画面下方的“恢复控制”可手动将键盘焦点返回 AirSim。鼠标视角的捕获受浏览器与模拟器限制，需要点击 AirSim 画面重新进入；键盘焦点恢复不等于自动恢复鼠标锁定。xpra 的 `keyboard=false` 仅隐藏屏幕虚拟键盘，不会禁用实体键盘。
-
-页面标题为“AirSim 飞行控制台”。页面已移除品牌标识、顶部宣传、工作空间导航、模拟环境标记和左下角帮助、设置入口及对应弹窗功能；画面连接配置仍可通过操作区的“连接设置”打开。
-
-## 天气接口与排查
-
-`POST /api/weather` 接收固定天气标识：`clear`、`rain`、`fog`、`snow`。每次切换会启用天气并写入全部 8 项参数，包含用于清除旧效果的零值。页面仅在收到成功响应后更新选中状态。
-
-在服务器上检查服务及 RPC 监听：
-
-```bash
-curl -s http://127.0.0.1:5173/api/health
-ss -ltnp | grep ':41451'
-```
-
-发送一次天气请求（会修改当前仿真天气）：
-
-```bash
-curl -i http://127.0.0.1:5173/api/weather \
-  -H 'Content-Type: application/json' \
-  -d '{"weather":"rain"}'
-```
-
-成功返回 `{"status":"applied","weather":"rain"}`；400 表示输入错误，409 表示正在切换，503 表示 RPC 连接或调用失败。排查时保留响应正文和 Flask 日志。`/api/health` 只检查 Flask，不检查 AirSim；`GET /api/airsim` 实际发送只读 `ping`，连通返回 200 与 `connected: true`，失败返回 503 与 `connected: false`，不修改天气。页面每 15 秒刷新 RPC 状态；隐藏页面暂停检查。`/api/config` 返回默认配置与接口能力，不代表连接状态。
-
-天气是同一 AirSim 实例的全局状态，多客户端最后一次成功操作生效。参数写入不是原子事务，中途失败可能部分生效，应重试完整预设；成功响应表示 RPC 调用完成，视觉效果仍取决于地图和材质支持。
-
-## 开发与验证
+所有持久运行数据位于项目内 `.runtime/`，并已加入 gitignore：
 
 ```text
-app.py                  Flask 页面、配置与天气路由
-weather_service.py      天气预设及 AirSim RPC 调用
-templates/index.html   页面模板
-static/                 前端交互与样式
-tests/                 Flask 与模拟 RPC 测试
+.runtime/
+  home/ cache/ config/ data/ run/ tmp/
+  sockets/ sessions/
+  settings.json       源 settings 的运行副本
+  manager.lock        唯一管理器锁
+  logs/launcher.log   xpra 与应用启动输出
+  logs/<场景>.log     Unreal 日志
 ```
+
+xpra 和 AirSim 通过 bwrap 启动：外部文件系统只读，仅项目目录可写；X11 /tmp、/dev/shm 使用隔离的临时文件系统。HOME、XDG 缓存/配置/运行目录均定向项目内。不会为了运行应用修改外部 settings、脚本、权限或用户配置。隔离不可用时拒绝启动，不能静默降级为无隔离运行。
+
+## 接口与状态
+
+| 接口 | 行为 |
+| --- | --- |
+| GET /api/health | Flask 健康，不探测场景 |
+| GET /api/config | 默认画面地址及功能开关 |
+| GET /api/scenes | 三个固定场景及可用性 |
+| GET /api/status | phase、当前/目标场景、端口、实例、天气、阶段与错误 |
+| POST /api/switch | JSON scene_id；异步任务返回 202，同一就绪场景返回 200 |
+| POST /api/cleanup | 有归属检查的异步停止与清理，返回 202 |
+| GET /api/airsim | 就绪场景的实际 RPC ping |
+| POST /api/weather | JSON weather 和当前 instance_id |
+
+phase 为 idle、stopping、starting、initializing、ready、error。HTTP 202 只代表已接受，需继续查询 /api/status；任务失败在 error 中报告。未知 ID 返回 400，忙碌/场景未就绪/过期实例返回 409，RPC 失败返回 503。
+
+状态携带 operation_id、instance_id、manager_id 和 revision。前端拒绝旧版本状态与旧实例天气响应；切换中每秒查询，稳定后每 5 秒查询。状态还返回 cleanup 处理清单，包含已确认的停止对象和实际强杀 PID。状态接口只检查实时端口和生命周期；初始化阶段还额外验证 RPC、目标 PID 对应窗口及完整 clear 调用。画面是否真正可见，仍以当前浏览器实际显示为准。
+
+天气请求示例：
+
+```bash
+curl -s http://127.0.0.1:5173/api/status
+curl -s http://127.0.0.1:5173/api/switch \
+  -H 'Content-Type: application/json' -d '{"scene_id":"abandonedpark"}'
+# 等待 ready 后，将其 instance_id 填入天气请求：
+curl -s http://127.0.0.1:5173/api/weather \
+  -H 'Content-Type: application/json' -d '{"weather":"rain","instance_id":"当前实例ID"}'
+```
+
+切换失败可重试目标场景或使用“停止并清理”。清理只处理已确认归属的会话，不能用于强制结束陌生进程。没有恢复旧飞行状态或无限自动重启机制。
+
+## 默认天气与多页面
+
+每个新实例先由后端初始化晴朗。已打开页面切到新实例时只同步结果，不重复初始化。新打开或刷新页面仍保留“首次连接自动应用晴朗”的既有行为；因此另一个页面刷新也可能改变全局天气。后续定时检查不会把手动选择重置为晴朗。
+
+每次天气设置写入全部八个参数，包含清除旧效果的零值。调用不是原子事务，失败可能部分生效，应重试完整预设；特殊地面效果仍取决于地图材质支持。
+
+## 验证
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
-# 可选：Node.js 18+，不需要安装 npm 依赖
+# Node.js 18+，无需 npm 依赖：
 node --test tests/test_frontend.cjs
 node --check static/app.js
+node --check static/scenes.js
 ```
 
-测试覆盖参数下发、无效输入、并发与异常处理，**使用模拟 RPC 响应，不能代替服务器实机验证**。前端测试直接运行实际 `static/app.js`，模拟 DOM 和接口，覆盖默认晴朗、连接恢复、失败重试、保留手动天气、天气切换后的焦点恢复及避免打断输入；不能代替真实浏览器渲染验证。后端仅依赖 Flask 与 msgpack，不需要安装 AirSim Python SDK。演示图片和字体分别来自 Unsplash、Google Fonts，需联网加载。
+单元测试覆盖安全归属、错误重试、并发门禁、实例校验、窗口显示控制及前端迟到响应。模拟测试不能替代实机。
 
-参考：[AirSim Python API](https://github.com/microsoft/AirSim/blob/main/PythonClient/airsim/client.py) · [xpra HTML5 配置](https://github.com/Xpra-org/xpra-html5/blob/master/docs/Configuration.md)
+2026-10-22 实机已完成三个环境之间六种有向切换，每次约 6–8 秒（包含该轮四种天气验证）。各环境的完整雨、雾、雪、晴朗调用均成功，并验证了忙碌期间拒绝天气与第二次切换，以及拒绝旧实例请求。原始结果位于本机 `.runtime/integration-scenes.json`。另已验证陌生端口不误杀、应用崩溃恢复、后端强杀后重启清理、手动清理，以及实际进程的外部目录只读挂载，记录在 `.runtime/integration-faults.json`。当前 27 项后端测试、12 项前端测试通过。
 
-## 服务器部署与验证（2026-10-21）
+浏览器自动化读取及截图持续超时，真实浏览器画面与键鼠仍需人工验收；窗口 PID、RPC、天气调用和 HTTP 画面入口已分别检查。不要将 iframe load 或 RPC 成功当作视觉与输入验收。
 
-- 工作目录：`/data/airsim-flight-console`。依赖、日志及测试产物均放在本目录的 `.venv/` 内。
-- 控制台：`http://172.27.137.174:5173/`；应用画面：`http://172.27.137.174:10000/`。
-- 复用既有 xpra `:100` / AirSimNH 进程；确认窗口标题为 `AirSimNH (64-bit Development SF_VULKAN_SM5)`，xpra 允许控制台嵌入并已启用共享。
-- Flask 在后台运行，日志为 `.venv/console.log`，PID 为 `.venv/console.pid`；没有配置开机启动。
-- 四组天气预设均经真实 RPC 返回成功，结果在 `.venv/integration-results.json`；13 项 Python 测试及 8 项前端回归测试通过。Python 测试日志在 `.venv/tests.log`。
-- 浏览器自动化读取页面及截图超时，因此尚未完成嵌入画面、天气视觉效果和按钮交互的浏览器验收。HTTP 成功与 RPC 成功不能代替视觉验收。
+当前未实现登录鉴权，修改接口拒绝跨来源浏览器请求，但这不等于身份认证。仅部署在受控可信网络；公网或多用户权限场景需另加认证与访问控制。
+
+## 文件结构
+
+```text
+app.py                    Flask、CLI、生命周期入口
+scene_launcher.py         三个固定场景和 argv 模板
+scene_processes.py        归属检查、隔离启动、受管停止与窗口显示
+environment_service.py    串行任务、状态、天气门禁和退出清理
+weather_service.py        AirSim MessagePack RPC 与天气预设
+templates/index.html      控制台模板
+static/app.js             通用界面、画面连接与天气
+static/scenes.js          场景请求、轮询、遮罩与状态同步
+tests/                    后端与前端测试
+```

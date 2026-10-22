@@ -108,7 +108,7 @@ class WeatherTests(unittest.TestCase):
         html = self.client.get('/').get_data(as_text=True)
         self.assertNotIn('data-add="weather"', html)
         self.assertNotIn('data-remove="weather"', html)
-        self.assertIn('data-add="scene"', html)
+        self.assertNotIn('data-add="scene"', html)
         self.assertIn('id="weather-status"', html)
 
 

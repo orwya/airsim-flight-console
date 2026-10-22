@@ -35,13 +35,15 @@ class AirSimWeatherService:
     def _rpc(self):
         """One bounded RPC connection, shared by read-only probes and presets."""
         deadline = time.monotonic() + self.timeout
+        current_method = "connect"
         try:
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as connection:
                 unpacker = msgpack.Unpacker(raw=False, max_buffer_size=1024 * 1024)
                 request_id = 0
 
                 def call(method, *args):
-                    nonlocal request_id
+                    nonlocal request_id, current_method
+                    current_method = method
                     request_id += 1
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -66,7 +68,7 @@ class AirSimWeatherService:
 
                 yield call
         except (OSError, ValueError, msgpack.UnpackException) as error:
-            raise WeatherUnavailable("AirSim RPC 连接失败，请检查模拟器及 RPC 地址、端口；若天气部分生效，请重试完整预设") from error
+            raise WeatherUnavailable(f"AirSim RPC {current_method} 失败，请检查模拟器及 RPC 地址、端口；若天气部分生效，请重试完整预设") from error
 
     def probe(self):
         """Verify RPC availability without changing the simulation."""

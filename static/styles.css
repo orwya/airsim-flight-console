@@ -46,3 +46,12 @@
 .console-toolbar{display:flex;justify-content:flex-end;margin-bottom:16px}
 #xpra-frame:focus-visible{outline:2px solid var(--mint);outline-offset:-2px}
 @media(max-width:560px){main{padding-top:16px}.console-toolbar{margin-bottom:12px}}
+
+/* Real scene lifecycle: block remote input until the target instance is ready. */
+.viewport .landscape{background-image:none;background:#101415}
+.scene-overlay{position:absolute;inset:0;z-index:3;background:#101415ed;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:#b5c9be;line-height:1.8}
+.scene-overlay[hidden]{display:none}
+.scene-cleanup{flex-shrink:0;border:1px solid #43584a;border-radius:5px;margin-top:10px;padding:7px;font-size:11px;color:#adc8b5}
+.scene-cleanup:disabled{opacity:.4;cursor:wait}
+#scene-list .option-button:disabled{opacity:.55;cursor:wait}
+#scene-status{max-height:96px;overflow:auto}

@@ -28,6 +28,15 @@ const viewport = $('#viewport');
 let toastTimer;
 function toast(message) { $('#toast').textContent = message; $('#toast').classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('visible'), 3600); }
 const DEFAULT_XPRA_URL = document.body.dataset.xpraUrl;
+const SCENE_CONTROL = document.body.dataset.sceneControl === 'true';
+let sceneBusy = false;
+let scenePhase = 'idle';
+let sceneInstance = null;
+let lastReadyInstance = null;
+let sceneRequestPending = false;
+let scenePollPending = false;
+let sceneRevision = -1;
+let sceneManagerId = null;
 let remoteActive = false;
 let activeXpraUrl = '';
 let connectionTimer;
@@ -66,7 +75,7 @@ function disconnectXpra() {
   remoteActive=false; clearTimeout(connectionTimer);
   $('#xpra-frame').hidden=true; $('#xpra-frame').removeAttribute('src');
   viewport.classList.remove('remote-mode');
-  $('#view-mode-label').textContent='演示预览'; $('#feed-status').textContent='本地演示 · 未连接远程窗口';
+  $('#view-mode-label').textContent='画面未连接'; $('#feed-status').textContent='画面已断开，可通过连接设置重新连接';
   $('#connect-label').textContent='连接 AirSim'; $('.feed-actions').hidden=true;
 }
 $('#xpra-frame').addEventListener('load',()=>{
@@ -77,7 +86,7 @@ $('#xpra-frame').addEventListener('load',()=>{
 $('#retry-feed').addEventListener('click',()=>{try {connectXpra(activeXpraUrl,false);} catch(error) {toast(error.message);}});
 $('#disconnect-feed').addEventListener('click',disconnectXpra);
 function focusAirSim(force=false) {
-  if (!remoteActive || modal.open) return;
+  if (!remoteActive || modal.open || (SCENE_CONTROL && scenePhase !== 'ready')) return;
   const frame = $('#xpra-frame');
   const active = document.activeElement;
   // Do not interrupt typing or another action performed while the RPC was pending.
@@ -89,10 +98,14 @@ function focusAirSim(force=false) {
 $('#focus-feed').addEventListener('click', () => focusAirSim(true));
 
 const options = {
-  scene: [{id:'mountain', name:'山地探索', detail:'Alpine Valley', preset:'mountain'}, {id:'city', name:'城市巡航', detail:'Urban District', preset:'city'}, {id:'coast', name:'海岸漫游', detail:'Coastal Escape', preset:'coast'}],
+  scene: [
+    {id:'airsimnh',name:'AirSimNH',detail:'AirSimNH',available:true},
+    {id:'abandonedpark',name:'AbandonedPark',detail:'AbandonedPark',available:true},
+    {id:'msbuild2018',name:'MSBuild2018',detail:'MSBuild2018',available:true}
+  ],
   weather: Object.freeze([{id:'clear', name:'晴朗', detail:'Clear skies', preset:'sun'}, {id:'rain', name:'雨天', detail:'Rain', preset:'rain'}, {id:'fog', name:'雾天', detail:'Fog', preset:'fog'}, {id:'snow', name:'雪天', detail:'Snow', preset:'snow'}])
 };
-const selected = {scene:'mountain', weather:null};
+const selected = {scene:null, weather:null};
 let weatherPending = false;
 let weatherInitialized = false;
 function renderList(type) {
@@ -103,10 +116,11 @@ function renderList(type) {
     button.className='scene-button option-button'+(selected[type]===item.id?' selected':'');
     button.setAttribute('aria-pressed',String(selected[type]===item.id));
     button.dataset.option=item.id;
-    if(type==='weather') button.disabled=weatherPending;
+    if(type==='weather') button.disabled=weatherPending || (SCENE_CONTROL && scenePhase !== 'ready');
+    else button.disabled=sceneBusy || !item.available || !SCENE_CONTROL;
     const thumb=document.createElement('span');
-    thumb.className=type==='scene'?'scene-thumb '+item.preset:'weather-symbol';
-    if(type==='weather') thumb.innerHTML=icon(item.preset);
+    thumb.className='weather-symbol';
+    thumb.innerHTML=icon(type==='weather'?item.preset:'folder');
     const label=document.createElement('span');
     label.className='option-label';
     const name=document.createElement('b'); name.textContent=item.name;
@@ -116,17 +130,15 @@ function renderList(type) {
     button.append(thumb,label,indicator);
     button.addEventListener('click',()=>{
       if(type==='weather') {applyWeather(item, true); return;}
-      selected[type]=item.id;
-      if(type==='scene') {viewport.dataset.scene=item.preset; $('.landscape').setAttribute('aria-label',item.name+'原始演示画面'); if(remoteActive) toast('场景选择仅记录在界面中，远程 AirSim 场景切换接口待接入');}
-      const position=list.scrollTop; renderList(type); list.scrollTop=position;
+      switchScene(item.id);
     });
     list.append(button);
   });
   $('#'+type+'-count').textContent=String(options[type].length).padStart(2,'0')+' 项';
-  if(type==='scene') document.querySelector('[data-remove="scene"]').disabled=options.scene.length<=1;
 }
 async function applyWeather(item, restoreInput=false) {
-  if(weatherPending) return;
+  if(weatherPending || (SCENE_CONTROL && (sceneBusy || scenePhase !== 'ready'))) return;
+  const requestInstance = sceneInstance;
   weatherPending=true;
   const list=$('#weather-list'); const position=list.scrollTop;
   const status=$('#weather-status');
@@ -135,59 +147,34 @@ async function applyWeather(item, restoreInput=false) {
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),35000);
   try {
-    const response=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weather:item.id}),signal:controller.signal});
+    const response=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weather:item.id,...(SCENE_CONTROL?{instance_id:requestInstance}:{})}),signal:controller.signal});
     const result=await response.json();
     if(!response.ok || result.status!=='applied' || result.weather!==item.id) throw new Error(result.message || '天气切换失败，请检查 AirSim 连接');
+    if (SCENE_CONTROL && (requestInstance !== sceneInstance || result.instance_id !== requestInstance)) return;
     selected.weather=item.id;
     weatherInitialized=true;
     status.textContent='已应用：'+item.name; status.dataset.state='success';
     toast('已将 AirSim 天气切换为「'+item.name+'」');
   } catch(error) {
+    if (SCENE_CONTROL && requestInstance !== sceneInstance) return;
     selected.weather=null;
     const message=error.name==='AbortError'?'请求超时，天气状态未确认，请重试':error instanceof SyntaxError?'服务返回异常，请检查 Flask 是否正常运行':error.message;
     status.textContent=message; status.dataset.state='error'; toast(message);
   } finally {
     clearTimeout(timer); weatherPending=false; list.setAttribute('aria-busy','false'); renderList('weather'); list.scrollTop=position;
-    if (restoreInput) focusAirSim();
+    if (restoreInput && (!SCENE_CONTROL || requestInstance === sceneInstance)) focusAirSim();
   }
 }
 renderList('scene'); renderList('weather');
-document.querySelectorAll('[data-remove]').forEach(button=>button.addEventListener('click',()=>{
-  const type=button.dataset.remove;
-  if(options[type].length<=1) return;
-  const index=options[type].findIndex(item=>item.id===selected[type]);
-  const removed=options[type].splice(index,1)[0];
-  selected[type]=options[type][Math.min(index,options[type].length-1)].id;
-  if(type==='scene') {const item=options.scene.find(item=>item.id===selected.scene);viewport.dataset.scene=item.preset;$('.landscape').setAttribute('aria-label',item.name+'原始演示画面');}
-  renderList(type); toast('已从本次会话移除「'+removed.name+'」');
-}));
-document.querySelectorAll('[data-add]').forEach(button=>button.addEventListener('click',()=>openModal('add-'+button.dataset.add)));
 document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => { $('#command').value = button.dataset.command; $('#command').focus(); }));
 const history = [];
 $('#command-form').addEventListener('submit', e => { e.preventDefault(); const command = $('#command').value.trim(); if (!command) { $('#command').focus(); toast('请输入飞行任务，或选择一条快捷指令'); return; } history.unshift({ command, time: new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); $('#command-feedback').textContent = `已记录「${command}」。当前为 UI 演示，指令尚未发送至无人机。`; $('#command').value = ''; });
 $('#fullscreen').addEventListener('click', async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await viewport.requestFullscreen(); } catch { toast('当前预览环境不支持全屏，请在独立浏览器中打开'); } });
 const captures = [];
-$('#capture').addEventListener('click', () => { if(remoteActive) {toast('远程画面截图需接入图像接口，当前无法保存真实截图');return;} captures.unshift({ scene:options.scene.find(item=>item.id===selected.scene).name, weather:options.weather.find(item=>item.id===selected.weather)?.name || '天气未设置', time:new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); toast('已将当前演示画面信息保存至媒体库（本次会话）'); });
+$('#capture').addEventListener('click', () => { if(remoteActive) {toast('远程画面截图需接入图像接口，当前无法保存真实截图');return;} captures.unshift({ scene:options.scene.find(item=>item.id===selected.scene)?.name || '未选择场景', weather:options.weather.find(item=>item.id===selected.weather)?.name || '天气未设置', time:new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); toast('已将当前演示画面信息保存至媒体库（本次会话）'); });
 const modal = $('#modal');
 function openModal(type) {
   const content = $('#modal-content');
-  if (type === 'add-scene') {
-    const group='scene';
-    const title='环境';
-    $('#modal-title').textContent='添加'+title;
-    content.innerHTML='<form id="add-option-form"><label class="modal-field" for="option-name">'+title+'名称</label><input class="modal-input" id="option-name" required maxlength="30" placeholder="输入'+title+'名称"/><label class="modal-field" for="option-preset">'+'演示画面模板'+'</label><select class="modal-input" id="option-preset"></select><p>仅添加本次会话中的 UI 选项，实际'+title+'资源将在接口接入后配置。</p><button class="modal-action" type="submit">添加'+title+'</button></form>';
-    const presets=[['mountain','山地画面'],['city','城市画面'],['coast','海岸画面']];
-    presets.forEach(([value,text])=>{const option=document.createElement('option'); option.value=value; option.textContent=text; $('#option-preset').append(option);});
-    $('#add-option-form').addEventListener('submit',e=>{
-      e.preventDefault(); const name=$('#option-name').value.trim();
-      if(!name) {$('#option-name').focus(); return;}
-      if(options[group].some(item=>item.name===name)) {toast('列表中已有同名'+title);return;}
-      const item={id:crypto.randomUUID(),name,detail:'自定义'+title+' · 演示',preset:$('#option-preset').value};
-      options[group].push(item); selected[group]=item.id;
-      if(group==='scene') {viewport.dataset.scene=item.preset;$('.landscape').setAttribute('aria-label',name+'原始演示画面');}
-      renderList(group); modal.close(); $('#'+group+'-list').lastElementChild.scrollIntoView({block:'nearest'}); toast('已添加「'+name+'」');
-    });
-  }
   if (type === 'connect') {
     $('#modal-title').textContent='连接 AirSim 画面';
     content.innerHTML='<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接用于显示 AirSim 应用窗口；右侧天气按钮通过 RPC 独立控制天气。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>';
@@ -234,6 +221,5 @@ async function checkAirSim() {
     rpcCheckPending = false;
   }
 }
-checkAirSim();
-setInterval(checkAirSim, 15000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAirSim(); });
+if (!SCENE_CONTROL) {checkAirSim(); setInterval(checkAirSim, 15000);}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) {if (SCENE_CONTROL) pollScenes(); else checkAirSim();} });
