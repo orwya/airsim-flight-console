@@ -8,7 +8,7 @@
   <title>AirSim 飞行控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
-<body data-xpra-url="{{ xpra_url }}" data-scene-control="{{ 'true' if scene_control else 'false' }}">
+<body data-xpra-url="{{ xpra_url }}" data-scene-control="true">
   <aside class="rail">
     <button class="rail-button active" data-icon="dashboard" aria-label="飞行控制台" title="飞行控制台"></button>
     <button class="rail-button" data-icon="route" data-modal="missions" aria-label="任务记录" title="任务记录"></button>

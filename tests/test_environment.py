@@ -8,11 +8,13 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from app import create_app
-from environment_service import EnvironmentService, SceneBusy, SceneConfig
+from config import Settings, airsim_rpc_port
+from environment_service import EnvironmentService, SceneBusy
 from scene_launcher import SCENES, get_commands
 from scene_processes import ProcessRuntime, SceneError
 
 ROOT = Path(__file__).resolve().parents[1]
+
 
 class SceneTests(unittest.TestCase):
     def setUp(self):
@@ -22,18 +24,23 @@ class SceneTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         settings = self.root / "source.json"
         settings.write_text('{"SimMode":"Multirotor"}')
-        self.config = SceneConfig(settings=str(settings), port_release_wait=.05,
-                                  kill_wait=.05, rpc_ready_timeout=.1, tcp_ready_timeout=.1,
-                                  poll_interval=.01)
+        self.config = Settings(
+            airsim_settings=str(settings),
+            root=self.root,
+            port_release_wait=0.05,
+            kill_wait=0.05,
+            rpc_ready_timeout=0.1,
+            xpra_ready_timeout=0.1,
+            poll_interval=0.01,
+        )
         self.weather = MagicMock()
-        self.service = EnvironmentService(self.root, self.config, self.weather)
+        self.service = EnvironmentService(self.config, self.weather)
         self.runtime = MagicMock()
         self.runtime.path = self.root
         (self.root / "logs").mkdir()
-        self.runtime.sandbox.side_effect = lambda args: args
         self.runtime.stop.return_value = []
         self.runtime.window_ready.return_value = True
-        self.runtime.holders.return_value = {100:("airsimnh", None)}
+        self.runtime.holders.return_value = {100: ("airsimnh", None)}
         self.service.startup_weather = self.weather
         self.service.runtime = self.runtime
         self.service.lease = object()  # No production lock or launch in unit tests.
@@ -44,10 +51,15 @@ class SceneTests(unittest.TestCase):
         process.wait.return_value = 0
         if error:
             self.weather.apply.side_effect = error
-        with patch("environment_service.port_alive", return_value=True), \
-             patch("environment_service.subprocess.Popen", return_value=process), \
-             patch("environment_service.identity", return_value=(1,os.getuid(),"fake",[])), \
-             patch("environment_service.kill_verified_tree") as kill:
+        with (
+            patch("environment_service.port_alive", return_value=True),
+            patch("environment_service.subprocess.Popen", return_value=process),
+            patch(
+                "environment_service.identity",
+                return_value=(1, os.getuid(), "fake", []),
+            ),
+            patch("environment_service.kill_verified_tree") as kill,
+        ):
             state, accepted = self.service.submit("airsimnh")
             self.service.worker.join(2)
             self.assertFalse(self.service.worker.is_alive())
@@ -93,8 +105,10 @@ class SceneTests(unittest.TestCase):
         self.runtime.stop.assert_not_called()
 
     def test_weather_rejects_old_instance_busy_and_not_ready(self):
-        self.service.state.update(phase="ready", scene="airsimnh", instance_id="current")
-        with patch("environment_service.port_alive",return_value=True):
+        self.service.state.update(
+            phase="ready", scene="airsimnh", instance_id="current"
+        )
+        with patch("environment_service.port_alive", return_value=True):
             with self.assertRaises(SceneBusy):
                 self.service.apply_weather("rain", "old")
             self.service.apply_weather("rain", "current")
@@ -104,89 +118,153 @@ class SceneTests(unittest.TestCase):
             self.service.apply_weather("clear", "current")
 
     def test_missing_rpc_invalidates_ready_status(self):
-        self.service.state.update(phase="ready",scene="airsimnh",instance_id="current")
-        with patch("environment_service.port_alive",side_effect=[True,False]):
+        self.service.state.update(
+            phase="ready", scene="airsimnh", instance_id="current"
+        )
+        with patch("environment_service.port_alive", side_effect=[True, False]):
             state = self.service.snapshot()
-        self.assertEqual(state["phase"],"error")
+        self.assertEqual(state["phase"], "error")
         self.assertIsNone(state["scene"])
 
-    def test_config_rejects_unsafe_values(self):
-        for kwargs in ({"display":":100; kill"}, {"tcp_port":41451},
-                       {"rpc_port":0}, {"poll_interval":float("nan")}):
+    def test_airsim_rpc_port_comes_from_settings(self):
+        settings = self.root / "port.json"
+        self.assertEqual(airsim_rpc_port(settings), 41451)  # 文件缺失
+        settings.write_text('{"SimMode":"Multirotor"}')
+        self.assertEqual(airsim_rpc_port(settings), 41451)  # 未配置
+        settings.write_text('{"ApiServerPort":4242}')
+        self.assertEqual(airsim_rpc_port(settings), 4242)
+        for bad in ('{"ApiServerPort":0}', '{"ApiServerPort":"4242"}', "[]"):
+            settings.write_text(bad)
             with self.assertRaises(ValueError):
-                SceneConfig(**kwargs)
+                airsim_rpc_port(settings)
+
+    def test_config_rejects_unsafe_values(self):
+        for kwargs in (
+            {"display": ":100; kill"},
+            {"xpra_port": 41451},
+            {"rpc_port": 0},
+            {"poll_interval": float("nan")},
+        ):
+            with self.assertRaises(ValueError):
+                Settings(**kwargs)
 
     def test_templates_do_not_run_chmod_scripts_or_browser_shell(self):
         for key, scene in SCENES.items():
             start, stop = get_commands(key, self.config, self.root)
-            self.assertIn("--daemon=no",start)
-            self.assertEqual(stop[2],"socket://"+str(self.root/"sessions"/"100"/"socket"))
+            self.assertIn("--daemon=no", start)
+            self.assertEqual(
+                stop[2], "socket://" + str(self.root / "sessions" / "100" / "socket")
+            )
             child = next(arg for arg in start if arg.startswith("--start-child="))
-            self.assertIn(scene.executable,child)
-            self.assertNotIn(".sh",child)
-            self.assertIn("-settings=",child)
+            self.assertIn(scene.executable, child)
+            self.assertNotIn(".sh", child)
+            self.assertIn("-settings=", child)
 
     def test_unknown_listener_is_not_killed(self):
-        runtime = ProcessRuntime(self.root,self.config)
-        with patch("scene_processes.listener_pids",return_value={111}), \
-             patch.object(runtime,"owned_scene",return_value=None), \
-             patch("scene_processes.identity",return_value=(1,os.getuid(),"/unknown",["unknown"])), \
-             patch("scene_processes.kill_verified_tree") as kill:
+        runtime = ProcessRuntime(self.config)
+        with (
+            patch("scene_processes.listener_pids", return_value={111}),
+            patch.object(runtime, "owned_scene", return_value=None),
+            patch(
+                "scene_processes.identity",
+                return_value=(1, os.getuid(), "/unknown", ["unknown"]),
+            ),
+            patch("scene_processes.kill_verified_tree") as kill,
+        ):
             with self.assertRaises(SceneError):
-                runtime.stop(["xpra","stop",":100"])
+                runtime.stop(["xpra", "stop", ":100"])
             kill.assert_not_called()
 
     def test_xpra_setproctitle_is_recognized_only_with_exact_runtime(self):
-        runtime = ProcessRuntime(self.root,self.config)
+        runtime = ProcessRuntime(self.config)
         exe = SCENES["airsimnh"].executable
         title = f"/usr/bin/xpra start :100 --start-child={exe} AirSimNH --socket-dir={runtime.path / 'sockets'}"
-        with patch("scene_processes.identity",return_value=(1,os.getuid(),os.path.realpath("/usr/bin/python3"),[title])):
-            self.assertEqual(runtime.owned_scene(111),"airsimnh")
-        with patch("scene_processes.identity",return_value=(1,os.getuid(),os.path.realpath("/usr/bin/python3"),[title.replace(":100",":1000")])):
+        with patch(
+            "scene_processes.identity",
+            return_value=(
+                1,
+                os.getuid(),
+                os.path.realpath("/usr/bin/python3"),
+                [title],
+            ),
+        ):
+            self.assertEqual(runtime.owned_scene(111), "airsimnh")
+        with patch(
+            "scene_processes.identity",
+            return_value=(
+                1,
+                os.getuid(),
+                os.path.realpath("/usr/bin/python3"),
+                [title.replace(":100", ":1000")],
+            ),
+        ):
             self.assertIsNone(runtime.owned_scene(111))
 
     def test_window_mapping_is_limited_to_verified_scene_pid(self):
-        runtime = ProcessRuntime(self.root,self.config)
-        info = MagicMock(stdout="windows.200.pid=500\n",returncode=0)
-        with patch("scene_processes.subprocess.run",return_value=info) as run, \
-             patch.object(runtime,"owned_scene",return_value="airsimnh"):
+        runtime = ProcessRuntime(self.config)
+        info = MagicMock(stdout="windows.200.pid=500\n", returncode=0)
+        with (
+            patch("scene_processes.subprocess.run", return_value=info) as run,
+            patch.object(runtime, "owned_scene", return_value="airsimnh"),
+        ):
             self.assertTrue(runtime.window_ready("airsimnh"))
-            self.assertEqual(len(run.call_args_list),3)
-            self.assertIn("map",run.call_args_list[1].args[0])
-            self.assertIn("focus",run.call_args_list[2].args[0])
-        with patch("scene_processes.subprocess.run",return_value=info) as run, \
-             patch.object(runtime,"owned_scene",return_value=None):
+            self.assertEqual(len(run.call_args_list), 3)
+            self.assertIn("map", run.call_args_list[1].args[0])
+            self.assertIn("focus", run.call_args_list[2].args[0])
+        with (
+            patch("scene_processes.subprocess.run", return_value=info) as run,
+            patch.object(runtime, "owned_scene", return_value=None),
+        ):
             self.assertFalse(runtime.window_ready("airsimnh"))
-            self.assertEqual(run.call_count,1)
+            self.assertEqual(run.call_count, 1)
+
 
 class SceneApiTests(unittest.TestCase):
     def setUp(self):
-        self.app = create_app({"TESTING":True,"SCENE_CONTROL_ENABLED":True})
+        (ROOT / ".runtime").mkdir(exist_ok=True)
+        temp = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")
+        self.addCleanup(temp.cleanup)
+        settings = Path(temp.name) / "settings.json"
+        settings.write_text('{"SimMode":"Multirotor","ApiServerPort":41451}')
+        self.app = create_app(Settings(airsim_settings=str(settings)))
         self.client = self.app.test_client()
-        self.manager = self.app.extensions["environment_service"]
+        self.manager = self.app.extensions["services"].scenes
 
     def test_fixed_scene_catalog_and_no_add_controls(self):
         response = self.client.get("/api/scenes")
-        self.assertEqual([s["id"] for s in response.json["scenes"]],list(SCENES))
+        self.assertEqual([s["id"] for s in response.json["scenes"]], list(SCENES))
         html = self.client.get("/").get_data(as_text=True)
-        self.assertIn('data-scene-control="true"',html)
-        self.assertNotIn('data-add="scene"',html)
-        self.assertIn('id="scene-overlay"',html)
+        self.assertIn('data-scene-control="true"', html)
+        self.assertNotIn('data-add="scene"', html)
+        self.assertIn('id="scene-overlay"', html)
 
     def test_routes_reject_invalid_busy_and_cross_origin(self):
-        self.assertEqual(self.client.post("/api/switch",json={"scene_id":"bad"}).status_code,400)
-        with patch.object(self.manager,"submit",side_effect=SceneBusy("busy")):
-            self.assertEqual(self.client.post("/api/switch",json={"scene_id":"airsimnh"}).status_code,409)
-        for path in ("/api/switch","/api/cleanup","/api/weather"):
-            response=self.client.post(path,json={},headers={"Origin":"http://evil.test"})
-            self.assertEqual(response.status_code,403)
-        self.assertEqual(self.client.get("/api/cleanup").status_code,405)
+        self.assertEqual(
+            self.client.post("/api/switch", json={"scene_id": "bad"}).status_code, 400
+        )
+        with patch.object(self.manager, "submit", side_effect=SceneBusy("busy")):
+            self.assertEqual(
+                self.client.post(
+                    "/api/switch", json={"scene_id": "airsimnh"}
+                ).status_code,
+                409,
+            )
+        for path in ("/api/switch", "/api/cleanup", "/api/weather"):
+            response = self.client.post(
+                path, json={}, headers={"Origin": "http://evil.test"}
+            )
+            self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.client.get("/api/cleanup").status_code, 405)
 
     def test_weather_closed_before_ready_and_uses_instance(self):
-        response=self.client.post("/api/weather",json={"weather":"rain","instance_id":"stale"})
-        self.assertEqual(response.status_code,409)
-        self.assertEqual(self.client.get("/api/airsim").status_code,503)
-        with patch.object(self.manager,"apply_weather",return_value="live") as apply:
-            result=self.client.post("/api/weather",json={"weather":"snow","instance_id":"live"})
-            apply.assert_called_once_with("snow","live")
-            self.assertEqual(result.json["instance_id"],"live")
+        response = self.client.post(
+            "/api/weather", json={"weather": "rain", "instance_id": "stale"}
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.client.get("/api/airsim").status_code, 503)
+        with patch.object(self.manager, "apply_weather", return_value="live") as apply:
+            result = self.client.post(
+                "/api/weather", json={"weather": "snow", "instance_id": "live"}
+            )
+            apply.assert_called_once_with("snow", "live")
+            self.assertEqual(result.json["instance_id"], "live")
