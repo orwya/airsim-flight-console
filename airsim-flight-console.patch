@@ -1,0 +1,3652 @@
+From a44cad06fa9723550662663da2927e843d47bab4 Mon Sep 17 00:00:00 2001
+From: kedior <kedior123@gmail.com>
+Date: Fri, 23 Oct 2026 16:08:48 +0800
+Subject: [PATCH] Drop sandbox and refactor
+
+Replace scattered config with a frozen Settings dataclass built from CLI
+args (one --ip derives both URLs; AirSim port from settings.json). Move
+to an app factory + cli.py, and drop the bwrap sandbox, .runtime copies,
+and env overrides from the launch path.
+
+Breaking changes:
+
+    --host, --xpra-url, --airsim-host   ->  --ip
+    --port                              ->  --http-port
+    --tcp-port                          ->  --xpra-port
+    SCENE_* environment variables       ->  command line only
+    gunicorn app:app                    ->  python app.py
+---
+ README.md                 | 331 +++++++++++++++--------
+ app.py                    | 180 +++++--------
+ cli.py                    |  48 ++++
+ config.py                 | 105 ++++++++
+ environment_service.py    | 299 +++++++++++++--------
+ scene_launcher.py         |  93 +++++--
+ scene_processes.py        | 163 +++++++----
+ static/app.js             | 551 +++++++++++++++++++++++++++-----------
+ static/scenes.js          | 155 +++++++----
+ templates/index.html      |   2 +-
+ tests/test_app.py         |  69 +++--
+ tests/test_environment.py | 206 +++++++++-----
+ tests/test_frontend.cjs   | 362 +++++++++++++++++--------
+ tests/test_weather.py     | 127 ++++++---
+ weather_service.py        |  73 ++++-
+ 15 files changed, 1919 insertions(+), 845 deletions(-)
+ create mode 100644 cli.py
+ create mode 100644 config.py
+
+diff --git a/README.md b/README.md
+index cfe0061..74af880 100644
+--- a/README.md
++++ b/README.md
+@@ -1,166 +1,283 @@
+ # AirSim Flight Console
+ 
+-基于 Flask 的 AirSim 网页控制台。通过 xpra 显示应用窗口，通过 MessagePack RPC 修改天气，并在网页中启动、切换、停止三个固定环境。
++在浏览器中启动、切换 AirSim 场景，并设置模拟天气的 Web 控制台。
+ 
+-## 已实现
++后端是一个 Flask 服务：用 [xpra](https://github.com/Xpra-org/xpra) 在虚拟 X 屏幕上运行 Unreal 场景，把画面通过 xpra 的 HTML5 客户端嵌进网页，同时通过 AirSim 的 MessagePack RPC 设置天气。
+ 
+-- 固定环境：AirSimNH、AbandonedPark、MSBuild2018。环境列表不再是演示，已移除增删入口。
+-- 点击环境后异步执行：停止旧 xpra/AirSim → 等端口释放 → 启动目标会话 → 确认目标窗口与 RPC → 初始化晴朗。
+-- 提供切换阶段、错误和“停止并清理”；切换中遮罩画面并关闭天气写入。再次选择已就绪的同一场景不重启。
+-- 晴朗、雨天、雾天、雪天四组完整预设；请求关联当前实例，拒绝旧实例请求。
+-- 天气操作后恢复 iframe 键盘焦点；鼠标视角捕获仍需用户点击画面。
+-
+-自然语言飞行任务、真实截图及独立无人机相机视频流尚未实现。输入的飞行指令只保存在本次浏览器会话，不会执行。
+-
+-## 连接关系与切换影响
+-
+-```text
+-浏览器 ── HTTP :5173 ── Flask 场景管理器
+-  │                       ├── RPC :41451 ── AirSim / 天气
+-  └── iframe / WS :10000 ── xpra :100 ── AirSim 应用窗口
+-planner ── RPC :41451 ───────────────────┘
+ ```
++浏览器
++ ├─ HTTP <ip>:5173 ─────── Flask 控制台 ── RPC 127.0.0.1:41451 ── AirSim
++ └─ iframe/WS <ip>:10000 ─ xpra :100 ── 虚拟屏幕 ── AirSim 应用窗口
++```
++
++`<ip>` 由启动参数 `--ip` 决定，同时用于后端访问和画面访问。
+ 
+-本实现按“重启整个 xpra 会话”的方案切换，不是运行中的地图热切换。旧实例退出后，飞行位置、控制状态及未保存的仿真状态会重置，网页重新连接画面。所有浏览器共用一个环境；切换会影响其他客户端。
++## 功能
+ 
+-planner 应在连接中断后重建客户端，等待 `GET /api/status` 的 `phase=ready` 再恢复控制，并重新获取实例相关状态。端口开放不代表初始化结束；Flask 天气门禁不能阻止 planner 直接访问 RPC。
++- 三个固定场景：AirSimNH、AbandonedPark、MSBuild2018
++- 异步切换（HTTP 202 + 状态轮询），带阶段进度与错误信息
++- 切换完成后自动初始化晴朗天气
++- 四组天气预设：晴朗、雨天、雾天、雪天
++- 天气请求绑定场景实例 ID，切换期间拒绝写入
++- 切换期间用遮罩拦截画面上的键鼠输入
+ 
+-## 服务器条件
++## 环境要求
+ 
+-- Linux、Python 3.10+、xpra、Xvfb、ss、bwrap，以及已有 GPU 驱动。
+-- 当前服务器 xpra 为 6.5.5；实现使用该版本支持的 `control map/focus`。无浏览器连接时也先显示目标窗口，避免 Vulkan/GameThread 阻塞天气初始化。
+-- 三套应用已安装在 `/data/airsim/<环境>/LinuxNoEditor/`。
+-- 源 settings 为 `/data/airsim/settings.json`，只读。后端生成项目内 settings 副本，保留原配置并设置 ApiServerPort、RpcEnabled。
+-- 三个原始 .sh 脚本包含 chmod。模板直接调用已具备执行权限的二进制，不执行这些脚本、不修改安装目录。
++- Linux，Python 3.10+
++- xpra（已在 6.5.5 验证）、Xvfb、`ss`（iproute2）
++- 可用的 GPU 驱动与 GLX
++- Unreal 会向 `~/.config/Epic/` 和 `~/.cache/` 写入配置与缓存，运行用户的 home 目录需可写
++- 三套场景安装于 `/data/airsim/<场景名>/LinuxNoEditor/`，可执行文件位于
++  `/data/airsim/<场景名>/LinuxNoEditor/<场景名>/Binaries/Linux/<场景名>`
+ 
+-首次启动：
++## 安装
+ 
+ ```bash
+-cd /data/airsim-flight-console
++git clone https://github.com/orwya/airsim-flight-console.git
++cd airsim-flight-console
+ python3 -m venv .venv
+-TMPDIR="$PWD/.venv" PIP_CACHE_DIR="$PWD/.venv/pip-cache" .venv/bin/python -m pip install -r requirements.txt
+-.venv/bin/python app.py --host 0.0.0.0 --port 5173
++.venv/bin/python -m pip install -r requirements.txt
+ ```
+ 
+-浏览器打开 `http://172.27.137.174:5173/`。不再需要先在终端手动启动 xpra；选择环境即启动。当前服务器后台网页日志为 `.venv/console.log`，PID 记录在 `.venv/console.pid`，没有设置开机启动。
++依赖仅 `Flask` 与 `msgpack`。
+ 
+-原先手动启动的 xpra/AirSim 不会被自动接管或强杀。若占用显示号或端口，先由操作者停止原会话，再从网页启动；“停止并清理”也不会越过归属检查。
++## 启动
+ 
+-## 配置
++```bash
++.venv/bin/python app.py --ip=172.27.137.174
++```
++
++浏览器打开 `http://172.27.137.174:5173/`，选择一个场景后等待状态变为「场景已就绪」。
++
++其余参数按需覆盖，例如更换端口与配置路径：
+ 
+ ```bash
+-.venv/bin/python app.py --host 0.0.0.0 --port 5173 \
+-  --display=:100 --tcp-port=10000 --rpc-port=41451 \
+-  --settings=/data/airsim/settings.json \
+-  --port-release-wait=10 --kill-wait=5 \
+-  --tcp-ready-timeout=30 --rpc-ready-timeout=120 --poll-interval=0.2
++.venv/bin/python app.py --ip=172.27.137.174 --xpra-port=10001 --settings=/opt/airsim/settings.json
+ ```
+ 
+-| 配置 | 默认值 | 说明 |
++运行时数据（日志、xpra 会话与 socket、管理器锁）写入项目内的 `.runtime/`，首次启动自动创建。
++
++## 配置
++
++| 参数 | 默认值 | 说明 |
+ | --- | --- | --- |
+-| --display | :100 | xpra 显示号 |
+-| --tcp-port | 10000 | 画面监听端口 |
+-| --rpc-port | 41451 | 生成 settings 和天气服务使用的统一端口 |
+-| --port-release-wait | 10 | 停止后等待释放；不是固定睡眠 |
+-| --kill-wait | 5 | 受管进程强杀后等待端口释放 |
+-| --tcp-ready-timeout | 30 | 画面服务启动上限 |
+-| --rpc-ready-timeout | 120 | RPC、归属与应用窗口就绪上限 |
+-| --poll-interval | 0.2 | 后端检查间隔 |
+-| XPRA_URL | http://172.27.137.174:10000/ | 浏览器可访问的画面地址 |
+-| AIRSIM_TIMEOUT | 5 | 普通天气请求超时；新实例初始化单独使用 30 秒 |
++| `--ip` | `127.0.0.1` | 后端监听、浏览器访问、画面访问共用的地址。必须是具体 IP，`0.0.0.0` 会被拒绝 |
++| `--http-port` | `5173` | 控制台监听端口 |
++| `--xpra-port` | `10000` | 画面（xpra）端口 |
++| `--display` | `:100` | xpra 显示号 |
++| `--settings` | `/data/airsim/settings.json` | AirSim 配置路径；RPC 端口也由此文件决定 |
++| `--airsim-timeout` | `5` | 普通天气请求超时（秒）；新实例初始化固定使用 30 秒 |
++| `--port-release-wait` | `10` | 停止旧会话后等待端口释放的上限（秒） |
++| `--kill-wait` | `5` | 强杀进程后等待端口释放的上限（秒） |
++| `--xpra-ready-timeout` | `30` | 等待画面端口就绪的上限（秒） |
++| `--rpc-ready-timeout` | `120` | 等待 RPC、窗口就绪的上限（秒） |
++| `--poll-interval` | `0.2` | 端口轮询间隔（秒） |
++
++由参数派生的值：
++
++| 值 | 来源 |
++| --- | --- |
++| 控制台地址 | `http://<ip>:<http-port>/` |
++| 画面地址 | `http://<ip>:<xpra-port>/` |
++| AirSim RPC 地址 | `127.0.0.1:<ApiServerPort>` |
+ 
+-更改 tcp-port 或浏览器访问主机时，需同时设置对应的 XPRA_URL。浏览器连接设置中保存的地址优先于服务端默认地址。HTTPS 网页需配套 HTTPS/WSS xpra。
++RPC 端口取自 settings.json 的 `ApiServerPort`，未配置时为 AirSim 默认的 `41451`。后端端口、画面端口、RPC 端口必须互不相同。
+ 
+-`python app.py` 自动启用场景管理。导入 `app:app` 默认只启用网页/天气，避免模块导入产生进程控制副作用；WSGI 使用场景管理时需设置 `SCENE_CONTROL_ENABLED=1`，且只允许一个服务进程。不要开启 Flask reloader 或多 worker。生产多进程部署前，应将管理器拆为独立服务。
++## HTTP API
+ 
+-## 模板与进程边界
++| 方法 | 路径 | 说明 |
++| --- | --- | --- |
++| GET | `/` | 控制台页面 |
++| GET | `/api/health` | 服务存活检查 |
++| GET | `/api/config` | 控制台地址、画面地址与功能开关 |
++| GET | `/api/scenes` | 场景列表及可用性 |
++| GET | `/api/status` | 当前状态快照 |
++| POST | `/api/switch` | 提交场景切换 |
++| POST | `/api/cleanup` | 停止并清理当前会话 |
++| GET | `/api/airsim` | 对就绪场景执行一次 RPC ping |
++| POST | `/api/weather` | 设置天气 |
++
++### GET /api/health
++
++服务存活检查，不涉及场景状态。
++
++```json
++{"status": "ok", "backend": "flask"}
++```
+ 
+-`scene_launcher.py` 集中维护三个场景名、二进制路径、启动与停止参数。修改后重启后端生效。模板为可信管理员配置，返回 argv 数组，通过 shell=False 执行；浏览器只能提交 scene_id，不能提交任意命令、路径或参数。
++### GET /api/config
+ 
+-停止前检查监听 PID、用户、实际可执行文件、精确显示号及项目运行路径。兼容 xpra 的 setproctitle 表示，不能仅凭命令里出现 :100 就认定归属。控制命令使用项目内 session socket 的明确地址，避免按显示号全局查找而连接其他会话。优先 xpra stop，超时再重新验证进程身份并处理对应进程树。端口归属未知时报告错误，不使用全局 pkill。
++```json
++{
++  "console_url": "http://172.27.137.174:5173/",
++  "xpra_url": "http://172.27.137.174:10000/",
++  "display_mode": "xpra-iframe",
++  "flight_control_available": false,
++  "weather_control_available": true
++}
++```
+ 
+-后端启动时清理确认属于本项目的残留会话；正常退出也执行有界清理。后台线程、天气请求和切换共用操作门禁，项目内 flock 阻止重复管理器。后端被强杀时，残留会话可由下次启动清理。
++`flight_control_available` 为预留字段，当前恒为 `false`。
+ 
+-## 项目目录与文件系统隔离
++### GET /api/scenes
+ 
+-所有持久运行数据位于项目内 `.runtime/`，并已加入 gitignore：
++```json
++{
++  "scenes": [
++    {"id": "airsimnh", "name": "AirSimNH", "available": true},
++    {"id": "abandonedpark", "name": "AbandonedPark", "available": true},
++    {"id": "msbuild2018", "name": "MSBuild2018", "available": true}
++  ]
++}
++```
+ 
+-```text
+-.runtime/
+-  home/ cache/ config/ data/ run/ tmp/
+-  sockets/ sessions/
+-  settings.json       源 settings 的运行副本
+-  manager.lock        唯一管理器锁
+-  logs/launcher.log   xpra 与应用启动输出
+-  logs/<场景>.log     Unreal 日志
++`available` 表示场景可执行文件存在且具有执行权限。
++
++### GET /api/status
++
++```json
++{
++  "manager_id": "6f1c…",
++  "revision": 7,
++  "phase": "starting",
++  "scene": null,
++  "target_scene": "abandonedpark",
++  "previous_scene": "airsimnh",
++  "instance_id": "b0a2…",
++  "operation_id": "0c93…",
++  "completed_operation_id": "51ab…",
++  "weather": null,
++  "error": null,
++  "stage": "正在启动 AbandonedPark",
++  "cleanup": [{"pid": 4242, "scene": "airsimnh", "action": "xpra_stop"}],
++  "port_xpra": false,
++  "port_rpc": false
++}
+ ```
+ 
+-xpra 和 AirSim 通过 bwrap 启动：外部文件系统只读，仅项目目录可写；X11 /tmp、/dev/shm 使用隔离的临时文件系统。HOME、XDG 缓存/配置/运行目录均定向项目内。不会为了运行应用修改外部 settings、脚本、权限或用户配置。隔离不可用时拒绝启动，不能静默降级为无隔离运行。
++| 字段 | 说明 |
++| --- | --- |
++| `phase` | `idle` / `stopping` / `starting` / `initializing` / `ready` / `error` |
++| `scene` | 当前就绪场景，非就绪时为 `null` |
++| `instance_id` | 本次场景实例标识；天气请求需要携带 |
++| `operation_id` | 当前操作标识 |
++| `completed_operation_id` | 最近一次完成的操作标识 |
++| `revision` | 状态版本号，每次变更递增 |
++| `manager_id` | 后端进程标识，重启后变化 |
++| `stage` | 面向用户展示的阶段或错误文案 |
++| `cleanup` | 停止旧会话时实际处理的进程清单 |
++| `port_xpra` / `port_rpc` | 两个端口的实时探测结果 |
++
++`revision` 与 `manager_id` 用于前端丢弃过期响应。
++
++### POST /api/switch
+ 
+-## 接口与状态
++请求：
+ 
+-| 接口 | 行为 |
++```json
++{"scene_id": "abandonedpark"}
++```
++
++响应 `202`（已受理，需轮询 `/api/status`）或 `200`（目标场景已就绪，未重启），body 为最新状态快照。
++
++| 状态码 | 条件 |
+ | --- | --- |
+-| GET /api/health | Flask 健康，不探测场景 |
+-| GET /api/config | 默认画面地址及功能开关 |
+-| GET /api/scenes | 三个固定场景及可用性 |
+-| GET /api/status | phase、当前/目标场景、端口、实例、天气、阶段与错误 |
+-| POST /api/switch | JSON scene_id；异步任务返回 202，同一就绪场景返回 200 |
+-| POST /api/cleanup | 有归属检查的异步停止与清理，返回 202 |
+-| GET /api/airsim | 就绪场景的实际 RPC ping |
+-| POST /api/weather | JSON weather 和当前 instance_id |
++| `400` | `scene_id` 不在场景列表中 |
++| `409` | 已有切换或天气操作在执行 |
++| `503` | 环境错误，例如端口被未受管进程占用 |
+ 
+-phase 为 idle、stopping、starting、initializing、ready、error。HTTP 202 只代表已接受，需继续查询 /api/status；任务失败在 error 中报告。未知 ID 返回 400，忙碌/场景未就绪/过期实例返回 409，RPC 失败返回 503。
++### POST /api/cleanup
+ 
+-状态携带 operation_id、instance_id、manager_id 和 revision。前端拒绝旧版本状态与旧实例天气响应；切换中每秒查询，稳定后每 5 秒查询。状态还返回 cleanup 处理清单，包含已确认的停止对象和实际强杀 PID。状态接口只检查实时端口和生命周期；初始化阶段还额外验证 RPC、目标 PID 对应窗口及完整 clear 调用。画面是否真正可见，仍以当前浏览器实际显示为准。
++停止受管会话并清空状态，返回 `202` 与状态快照。忙碌时返回 `409`。
+ 
+-天气请求示例：
++### GET /api/airsim
+ 
+-```bash
+-curl -s http://127.0.0.1:5173/api/status
+-curl -s http://127.0.0.1:5173/api/switch \
+-  -H 'Content-Type: application/json' -d '{"scene_id":"abandonedpark"}'
+-# 等待 ready 后，将其 instance_id 填入天气请求：
+-curl -s http://127.0.0.1:5173/api/weather \
+-  -H 'Content-Type: application/json' -d '{"weather":"rain","instance_id":"当前实例ID"}'
++```json
++{"connected": true, "message": "AirSim RPC 已连接"}
+ ```
+ 
+-切换失败可重试目标场景或使用“停止并清理”。清理只处理已确认归属的会话，不能用于强制结束陌生进程。没有恢复旧飞行状态或无限自动重启机制。
++场景未就绪或 RPC 不通时返回 `503`。
+ 
+-## 默认天气与多页面
++### POST /api/weather
+ 
+-每个新实例先由后端初始化晴朗。已打开页面切到新实例时只同步结果，不重复初始化。新打开或刷新页面仍保留“首次连接自动应用晴朗”的既有行为；因此另一个页面刷新也可能改变全局天气。后续定时检查不会把手动选择重置为晴朗。
++请求：
+ 
+-每次天气设置写入全部八个参数，包含清除旧效果的零值。调用不是原子事务，失败可能部分生效，应重试完整预设；特殊地面效果仍取决于地图材质支持。
++```json
++{"weather": "rain", "instance_id": "b0a2…"}
++```
+ 
+-## 验证
++`weather` 取 `clear` / `rain` / `fog` / `snow`；`instance_id` 来自 `/api/status`，用于拒绝过期实例的请求。
+ 
+-```bash
+-.venv/bin/python -m unittest discover -s tests -v
+-# Node.js 18+，无需 npm 依赖：
+-node --test tests/test_frontend.cjs
+-node --check static/app.js
+-node --check static/scenes.js
++```json
++{"weather": "rain", "status": "applied", "instance_id": "b0a2…"}
+ ```
+ 
+-单元测试覆盖安全归属、错误重试、并发门禁、实例校验、窗口显示控制及前端迟到响应。模拟测试不能替代实机。
++| 状态码 | 条件 |
++| --- | --- |
++| `400` | 天气名称不合法 |
++| `409` | 场景未就绪、实例不匹配或操作忙碌 |
++| `503` | AirSim RPC 调用失败 |
++
++## 场景切换流程
++
++一次切换按顺序执行：
+ 
+-2026-10-22 实机已完成三个环境之间六种有向切换，每次约 6–8 秒（包含该轮四种天气验证）。各环境的完整雨、雾、雪、晴朗调用均成功，并验证了忙碌期间拒绝天气与第二次切换，以及拒绝旧实例请求。原始结果位于本机 `.runtime/integration-scenes.json`。另已验证陌生端口不误杀、应用崩溃恢复、后端强杀后重启清理、手动清理，以及实际进程的外部目录只读挂载，记录在 `.runtime/integration-faults.json`。当前 27 项后端测试、12 项前端测试通过。
++1. 检查目标场景的可执行文件与权限
++2. 查询画面端口与 RPC 端口的监听进程，核对归属后停止旧会话
++   （优先 `xpra stop`；超时后重新核对进程身份并结束对应进程树）
++3. 等待两个端口释放
++4. 启动新的 xpra 会话，以 `--start-child` 拉起目标场景
++5. 依次等待：画面端口可连接 → RPC 端口可连接且属于目标场景 → RPC ping 成功 → 目标窗口已显示并聚焦
++6. 应用晴朗天气，状态置为 `ready`
+ 
+-浏览器自动化读取及截图持续超时，真实浏览器画面与键鼠仍需人工验收；窗口 PID、RPC、天气调用和 HTTP 画面入口已分别检查。不要将 iframe load 或 RPC 成功当作视觉与输入验收。
++本机实测一次切换约 6–8 秒。切换会重置飞行位置与仿真状态，浏览器画面需要重新连接。
+ 
+-当前未实现登录鉴权，修改接口拒绝跨来源浏览器请求，但这不等于身份认证。仅部署在受控可信网络；公网或多用户权限场景需另加认证与访问控制。
++进程归属通过「监听端口的进程 + 其可执行文件与 `-settings=` 参数」判定；无法确认归属时返回错误，不执行清理。
+ 
+-## 文件结构
++## 目录结构
+ 
+ ```text
+-app.py                    Flask、CLI、生命周期入口
+-scene_launcher.py         三个固定场景和 argv 模板
+-scene_processes.py        归属检查、隔离启动、受管停止与窗口显示
+-environment_service.py    串行任务、状态、天气门禁和退出清理
++app.py                    Flask 装配：钩子、路由、错误处理
++cli.py                    命令行参数与进程生命周期
++config.py                 配置入口：Settings、校验、派生地址
++environment_service.py    场景切换状态机与串行任务
++scene_processes.py        端口与进程归属检查、受管停止、窗口确认
++scene_launcher.py         三个场景与启停命令模板
+ weather_service.py        AirSim MessagePack RPC 与天气预设
+ templates/index.html      控制台模板
+-static/app.js             通用界面、画面连接与天气
+-static/scenes.js          场景请求、轮询、遮罩与状态同步
++static/app.js             界面、画面连接与天气交互
++static/scenes.js          场景请求、轮询与状态同步
+ tests/                    后端与前端测试
+ ```
++
++## 开发与测试
++
++```bash
++.venv/bin/python -m unittest discover -s tests -v
++node --check static/app.js
++node --check static/scenes.js
++node tests/test_frontend.cjs
++```
++
++其中 3 个用例需要 `/data/airsim/` 下的场景可执行文件，在未安装场景的机器上会失败。
++
++## 故障排查
++
++| 现象 | 处理 |
++| --- | --- |
++| 切换卡在 `starting`，`stage` 显示「画面端口启动超时」 | 查看 `.runtime/logs/launcher.log`。若出现 `Server is already active for display 100`，删除 `/tmp/.X100-lock` 后重试 |
++| 状态 `ready` 但画面空白 | 从浏览器访问 `/api/config` 返回的 `xpra_url`，确认该地址可达 |
++| 卡在 `initializing` | 检查 settings 中的 `ApiServerPort` 与 `ss -ltnp` 显示的实际监听端口是否一致 |
++| 提示端口属于未受管进程 | 该端口被其他进程占用；结束该进程后重试，或更换 `--xpra-port` |
++| 提示另一个场景管理器正在运行 | 已有后端实例持有 `.runtime/manager.lock` |
++
++日志位置：`.runtime/logs/launcher.log`（xpra 与应用启动输出）、`.runtime/logs/<场景>.log`（Unreal 日志）。
++
++## 已知限制
++
++- 单进程运行；多个实例会争用 `.runtime/manager.lock`，后来的实例在首次操作时报错
++- 场景为三个固定项，增减需修改 `scene_launcher.py`
++- 同一时刻只有一个受管场景，不支持并行预热
++- 切换是重启整个 xpra 会话，不是地图热切换
++- 所有浏览器共用一个场景，切换会影响其他打开的控制台
++- 飞行指令输入、截图、视频流为占位界面，尚未接入
+\ No newline at end of file
+diff --git a/app.py b/app.py
+index 0ba7fe2..a5fb2bc 100644
+--- a/app.py
++++ b/app.py
+@@ -1,51 +1,40 @@
+-"""Flask console and asynchronous, locally managed AirSim scene switching."""
+-import argparse
+-import os
+-from pathlib import Path
+-import signal
+-from urllib.parse import parse_qsl, urlsplit
++"""Flask 装配与路由。所有配置来自 config.Settings，不读取环境变量。"""
++
++from dataclasses import dataclass
+ 
+ from flask import Flask, jsonify, render_template, request
+ 
+-from environment_service import EnvironmentService, SceneBusy, SceneConfig
++from config import LOOPBACK, Settings
++from environment_service import EnvironmentService, SceneBusy
+ from scene_launcher import scene_list
+ from scene_processes import SceneError
+-from weather_service import AirSimWeatherService, WEATHER_PRESETS, WeatherBusy, WeatherUnavailable
++from weather_service import (
++    AirSimWeatherService,
++    WEATHER_PRESETS,
++    WeatherBusy,
++    WeatherUnavailable,
++)
++
++
++@dataclass(frozen=True)
++class Services:
++    settings: Settings
++    weather: AirSimWeatherService
++    scenes: EnvironmentService
++
+ 
+-def create_app(test_config=None):
++def create_app(settings: Settings) -> Flask:
+     app = Flask(__name__)
+-    app.config.from_mapping(
+-        XPRA_URL=os.environ.get("XPRA_URL", "http://172.27.137.174:10000/"),
+-        AIRSIM_HOST=os.environ.get("AIRSIM_HOST", "127.0.0.1"),
+-        AIRSIM_PORT=int(os.environ.get("AIRSIM_PORT", "41451")),
+-        AIRSIM_TIMEOUT=float(os.environ.get("AIRSIM_TIMEOUT", "5")),
+-        SCENE_CONTROL_ENABLED=os.environ.get("SCENE_CONTROL_ENABLED", "0") == "1",
+-        SCENE_CONFIG=None,
+-    )
+-    if test_config:
+-        app.config.update(test_config)
+-    if not 1 <= app.config["AIRSIM_PORT"] <= 65535 or not 0 < app.config["AIRSIM_TIMEOUT"] <= 30:
+-        raise ValueError("Invalid AIRSIM_PORT or AIRSIM_TIMEOUT (0 < timeout <= 30)")
+-    weather = AirSimWeatherService(app.config["AIRSIM_HOST"], app.config["AIRSIM_PORT"],
+-                                   app.config["AIRSIM_TIMEOUT"])
+-    app.extensions["weather_service"] = weather
+-    manager = None
+-    if app.config["SCENE_CONTROL_ENABLED"]:
+-        config = app.config["SCENE_CONFIG"] or SceneConfig(rpc_port=app.config["AIRSIM_PORT"])
+-        if app.config["AIRSIM_HOST"] not in ("127.0.0.1", "localhost"):
+-            raise ValueError("Scene management only supports a local AirSim RPC")
+-        if config.rpc_port != app.config["AIRSIM_PORT"]:
+-            raise ValueError("Scene and weather RPC ports must match")
+-        manager = EnvironmentService(Path(__file__).parent, config, weather)
+-    app.extensions["environment_service"] = manager
+-
+-    url = urlsplit(app.config["XPRA_URL"])
+-    if url.scheme not in ("http", "https") or not url.hostname:
+-        raise ValueError("XPRA_URL must be an absolute HTTP or HTTPS URL")
+-    if url.username or url.password or any(key.lower() in ("password", "token")
+-                                          for key, _ in parse_qsl(url.query)):
+-        raise ValueError("XPRA_URL must not contain credentials")
++    weather = AirSimWeatherService(LOOPBACK, settings.rpc_port, settings.airsim_timeout)
++    services = Services(settings, weather, EnvironmentService(settings, weather))
++    app.extensions["services"] = services
++    _install_hooks(app)
++    _install_routes(app, services)
++    _install_error_handlers(app)
++    return app
++
+ 
++def _install_hooks(app):
+     @app.before_request
+     def reject_cross_origin_writes():
+         if request.method == "POST" and request.path.startswith("/api/"):
+@@ -53,7 +42,9 @@ def create_app(test_config=None):
+             if request.headers.get("Sec-Fetch-Site") == "cross-site" or (
+                 origin and origin != f"{request.scheme}://{request.host}"
+             ):
+-                return jsonify(error="cross_origin", message="不允许跨来源控制请求"), 403
++                return jsonify(
++                    error="cross_origin", message="不允许跨来源控制请求"
++                ), 403
+ 
+     @app.after_request
+     def prevent_stale_status(response):
+@@ -61,10 +52,21 @@ def create_app(test_config=None):
+             response.headers["Cache-Control"] = "no-store"
+         return response
+ 
++
++def _scene_failure(error):
++    if isinstance(error, ValueError):
++        return jsonify(error="invalid_scene", message=str(error)), 400
++    if isinstance(error, SceneBusy):
++        return jsonify(error="environment_busy", message=str(error)), 409
++    return jsonify(error="environment_error", message=str(error)), 503
++
++
++def _install_routes(app, services: Services):
++    settings, weather, scenes = services.settings, services.weather, services.scenes
++
+     @app.get("/")
+     def index():
+-        return render_template("index.html", xpra_url=app.config["XPRA_URL"],
+-                               scene_control=manager is not None)
++        return render_template("index.html", xpra_url=settings.xpra_url)
+ 
+     @app.get("/api/health")
+     def health():
+@@ -72,52 +74,43 @@ def create_app(test_config=None):
+ 
+     @app.get("/api/config")
+     def configuration():
+-        return jsonify(xpra_url=app.config["XPRA_URL"], display_mode="xpra-iframe",
+-                       flight_control_available=False, weather_control_available=True,
+-                       scene_control_available=manager is not None)
++        return jsonify(
++            console_url=settings.console_url,
++            xpra_url=settings.xpra_url,
++            display_mode="xpra-iframe",
++            flight_control_available=False,
++            weather_control_available=True,
++        )
+ 
+     @app.get("/api/scenes")
+-    def scenes():
+-        return jsonify(scenes=scene_list(), enabled=manager is not None)
++    def scenes_catalog():
++        return jsonify(scenes=scene_list())
+ 
+     @app.get("/api/status")
+     def status():
+-        if manager is None:
+-            return jsonify(phase="disabled", scene=None, instance_id=None, weather=None,
+-                           stage="场景管理未启用", error=None)
+-        return jsonify(manager.snapshot())
++        return jsonify(scenes.snapshot())
+ 
+     @app.post("/api/switch")
+     def switch():
+-        if manager is None:
+-            return jsonify(error="disabled", message="场景管理未启用"), 503
+         payload = request.get_json(silent=True)
+         key = payload.get("scene_id") if isinstance(payload, dict) else None
+         try:
+-            state, accepted = manager.submit(key)
+-        except ValueError as error:
+-            return jsonify(error="invalid_scene", message=str(error)), 400
+-        except SceneBusy as error:
+-            return jsonify(error="environment_busy", message=str(error)), 409
+-        except SceneError as error:
+-            return jsonify(error="environment_error", message=str(error)), 503
++            state, accepted = scenes.submit(key)
++        except (ValueError, SceneBusy, SceneError) as error:
++            return _scene_failure(error)
+         return jsonify(state), 202 if accepted else 200
+ 
+     @app.post("/api/cleanup")
+     def cleanup():
+-        if manager is None:
+-            return jsonify(error="disabled", message="场景管理未启用"), 503
+         try:
+-            state, _ = manager.submit(cleanup=True)
+-        except SceneBusy as error:
+-            return jsonify(error="environment_busy", message=str(error)), 409
+-        except SceneError as error:
+-            return jsonify(error="environment_error", message=str(error)), 503
++            state, _ = scenes.submit(cleanup=True)
++        except (SceneBusy, SceneError) as error:
++            return _scene_failure(error)
+         return jsonify(state), 202
+ 
+     @app.get("/api/airsim")
+     def airsim_status():
+-        if manager and manager.snapshot()["phase"] != "ready":
++        if scenes.snapshot()["phase"] != "ready":
+             return jsonify(connected=False, message="请先启动并等待场景就绪"), 503
+         try:
+             weather.probe()
+@@ -130,21 +123,20 @@ def create_app(test_config=None):
+         payload = request.get_json(silent=True)
+         selected = payload.get("weather") if isinstance(payload, dict) else None
+         if not isinstance(selected, str) or selected not in WEATHER_PRESETS:
+-            return jsonify(error="invalid_weather", message="请选择晴朗、雨天、雾天或雪天"), 400
++            return jsonify(
++                error="invalid_weather", message="请选择晴朗、雨天、雾天或雪天"
++            ), 400
+         try:
+-            instance = manager.apply_weather(selected, payload.get("instance_id")) if manager else None
+-            if manager is None:
+-                weather.apply(selected)
++            instance = scenes.apply_weather(selected, payload.get("instance_id"))
+         except (WeatherBusy, SceneBusy) as error:
+-            return jsonify(error="environment_busy" if manager else "weather_busy", message=str(error)), 409
++            return jsonify(error="environment_busy", message=str(error)), 409
+         except WeatherUnavailable as error:
+             app.logger.warning("Weather RPC failed: %s", error)
+             return jsonify(error="airsim_unavailable", message=str(error)), 503
+-        result = dict(weather=selected, status="applied")
+-        if manager:
+-            result["instance_id"] = instance
+-        return jsonify(result)
++        return jsonify(weather=selected, status="applied", instance_id=instance)
++
+ 
++def _install_error_handlers(app):
+     @app.errorhandler(404)
+     def not_found(error):
+         return jsonify(error="not_found"), 404
+@@ -152,35 +144,9 @@ def create_app(test_config=None):
+     @app.errorhandler(405)
+     def method_not_allowed(error):
+         return jsonify(error="method_not_allowed"), 405
+-    return app
+ 
+-app = create_app()
+ 
+ if __name__ == "__main__":
+-    parser = argparse.ArgumentParser(description="AirSim Flight Console")
+-    parser.add_argument("--host", default="127.0.0.1")
+-    parser.add_argument("--port", type=int, default=5173)
+-    parser.add_argument("--display", default=":100")
+-    parser.add_argument("--tcp-port", type=int, default=10000)
+-    parser.add_argument("--rpc-port", type=int, default=41451)
+-    parser.add_argument("--settings", default="/data/airsim/settings.json")
+-    for option, default in (("port-release-wait",10), ("kill-wait",5),
+-                            ("tcp-ready-timeout",30), ("rpc-ready-timeout",120),
+-                            ("poll-interval",0.2)):
+-        parser.add_argument("--" + option, type=float, default=default)
+-    args = parser.parse_args()
+-    config = SceneConfig(display=args.display, tcp_port=args.tcp_port, rpc_port=args.rpc_port,
+-                         settings=args.settings, port_release_wait=args.port_release_wait,
+-                         kill_wait=args.kill_wait, tcp_ready_timeout=args.tcp_ready_timeout,
+-                         rpc_ready_timeout=args.rpc_ready_timeout, poll_interval=args.poll_interval)
+-    app = create_app({"SCENE_CONTROL_ENABLED":True, "SCENE_CONFIG":config,
+-                      "AIRSIM_PORT":config.rpc_port})
+-    manager = app.extensions["environment_service"]
+-    def terminate(signum, frame):
+-        raise SystemExit(0)
+-    signal.signal(signal.SIGTERM, terminate)
+-    try:
+-        manager.submit(cleanup=True)
+-        app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
+-    finally:
+-        manager.shutdown()
++    from cli import main
++
++    main()
+diff --git a/cli.py b/cli.py
+new file mode 100644
+index 0000000..b7e3201
+--- /dev/null
++++ b/cli.py
+@@ -0,0 +1,48 @@
++"""命令行入口与进程生命周期。"""
++
++import argparse
++import signal
++
++from app import create_app
++from config import build_settings
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(description="AirSim Flight Console")
++    parser.add_argument("--ip", default="127.0.0.1", help="后端监听与画面访问共用的 IP")
++    parser.add_argument("--http-port", type=int, default=5173)
++    parser.add_argument("--display", default=":100")
++    parser.add_argument("--xpra-port", type=int, default=10000)
++    parser.add_argument("--settings", default="/data/airsim/settings.json")
++    parser.add_argument("--airsim-timeout", type=float, default=5.0)
++    for option, default in (
++        ("port-release-wait", 10),
++        ("kill-wait", 5),
++        ("xpra-ready-timeout", 30),
++        ("rpc-ready-timeout", 120),
++        ("poll-interval", 0.2),
++    ):
++        parser.add_argument("--" + option, type=float, default=default)
++    return parser
++
++
++def main(argv=None):
++    settings = build_settings(build_parser().parse_args(argv))
++    app = create_app(settings)
++    scenes = app.extensions["services"].scenes
++
++    def terminate(signum, frame):
++        raise SystemExit(0)
++
++    signal.signal(signal.SIGTERM, terminate)
++    try:
++        scenes.submit(cleanup=True)  # 启动清扫上一轮残留会话
++        app.run(
++            host=settings.ip, port=settings.http_port, debug=False, use_reloader=False
++        )
++    finally:
++        scenes.shutdown()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/config.py b/config.py
+new file mode 100644
+index 0000000..b1453e9
+--- /dev/null
++++ b/config.py
+@@ -0,0 +1,105 @@
++"""All configuration lives here: built from the command line, validated once, URLs derived."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++import ipaddress
++import json
++import math
++from pathlib import Path
++import re
++
++DEFAULT_RPC_PORT = 41451  # AirSim 自身的默认端口
++LOOPBACK = "127.0.0.1"  # AirSim RPC 只监听本机回环，与部署地址无关
++
++TIMEOUT_FIELDS = (
++    "airsim_timeout",
++    "port_release_wait",
++    "kill_wait",
++    "xpra_ready_timeout",
++    "rpc_ready_timeout",
++    "poll_interval",
++)
++
++
++def airsim_rpc_port(settings_path):
++    """AirSim RPC 端口：以 settings.json 的 ApiServerPort 为准，缺省用 AirSim 默认值。"""
++    path = Path(settings_path)
++    if not path.is_file():
++        # 文件缺失时 AirSim 退回默认配置，端口同样是默认值。
++        return DEFAULT_RPC_PORT
++    data = json.loads(path.read_text())
++    if not isinstance(data, dict):
++        raise ValueError("settings 必须是 JSON 对象")
++    port = data.get("ApiServerPort", DEFAULT_RPC_PORT)
++    if type(port) is not int or not 1 <= port <= 65535:
++        raise ValueError(f"settings 的 ApiServerPort 无效：{port!r}")
++    return port
++
++
++@dataclass(frozen=True)
++class Settings:
++    ip: str = LOOPBACK  # 唯一地址：后端监听、浏览器访问、xpra 画面共用
++    http_port: int = 5173
++    display: str = ":100"
++    xpra_port: int = 10000
++    airsim_settings: str = "/data/airsim/settings.json"
++    airsim_timeout: float = 5.0
++    port_release_wait: float = 10.0
++    kill_wait: float = 5.0
++    xpra_ready_timeout: float = 30.0
++    rpc_ready_timeout: float = 120.0
++    poll_interval: float = 0.2
++    rpc_port: int | None = None  # 留空则从 settings 文件解析，不是命令行参数
++    root: Path = field(default_factory=lambda: Path(__file__).resolve().parent)
++
++    @property
++    def console_url(self):
++        return f"http://{self.ip}:{self.http_port}/"
++
++    @property
++    def xpra_url(self):
++        return f"http://{self.ip}:{self.xpra_port}/"
++
++    def __post_init__(self):
++        if self.rpc_port is None:
++            object.__setattr__(self, "rpc_port", airsim_rpc_port(self.airsim_settings))
++        try:
++            address = ipaddress.ip_address(self.ip)
++        except ValueError as error:
++            raise ValueError(f"--ip 必须是具体的 IP 地址：{self.ip}") from error
++        if address.is_unspecified:
++            raise ValueError("--ip 不能是 0.0.0.0 或 ::，否则浏览器无法访问")
++        if not all(
++            type(p) is int and 1 <= p <= 65535
++            for p in (self.http_port, self.xpra_port, self.rpc_port)
++        ):
++            raise ValueError("端口必须在 1-65535 之间")
++        if len({self.http_port, self.xpra_port, self.rpc_port}) != 3:
++            raise ValueError("后端端口、画面端口、RPC 端口必须互不相同")
++        if not re.fullmatch(r":[1-9][0-9]{0,4}", self.display):
++            raise ValueError("--display 必须形如 :100")
++        for name in TIMEOUT_FIELDS:
++            value = getattr(self, name)
++            if not math.isfinite(value) or not 0 < value <= 600:
++                raise ValueError(f"--{name.replace('_', '-')} 必须在 (0, 600] 之间")
++        if not Path(self.root).is_dir():
++            raise ValueError(f"项目根目录不存在：{self.root}")
++        object.__setattr__(self, "root", Path(self.root).resolve())
++
++
++def build_settings(args):
++    """命令行参数 → Settings。读取 settings 文件只在这里发生一次。"""
++    return Settings(
++        ip=args.ip,
++        http_port=args.http_port,
++        display=args.display,
++        xpra_port=args.xpra_port,
++        airsim_settings=args.settings,
++        airsim_timeout=args.airsim_timeout,
++        port_release_wait=args.port_release_wait,
++        kill_wait=args.kill_wait,
++        xpra_ready_timeout=args.xpra_ready_timeout,
++        rpc_ready_timeout=args.rpc_ready_timeout,
++        poll_interval=args.poll_interval,
++    )
+diff --git a/environment_service.py b/environment_service.py
+index c90b7f3..e28761c 100644
+--- a/environment_service.py
++++ b/environment_service.py
+@@ -1,54 +1,35 @@
+-"""Serialized scene switching. No untrusted command strings or global process-name kills."""
+-from dataclasses import dataclass
++"""Serialized scene switching: one operation at a time, ownership checked before any kill."""
++
+ from pathlib import Path
+ import fcntl
+-import json
+-import math
+ import os
+-import re
+ import subprocess
+ import threading
+ import time
+ import uuid
+ 
++from config import LOOPBACK, Settings
+ from scene_launcher import SCENES, get_commands
+-from scene_processes import ProcessRuntime, SceneError, identity, kill_verified_tree, port_alive
++from scene_processes import (
++    ProcessRuntime,
++    SceneError,
++    identity,
++    kill_verified_tree,
++    port_alive,
++)
+ from weather_service import WeatherUnavailable, AirSimWeatherService
+ 
+-BUSY = frozenset(("stopping", "starting", "initializing"))
+ 
+ class SceneBusy(SceneError):
+     pass
+ 
+-@dataclass(frozen=True)
+-class SceneConfig:
+-    display: str = ":100"
+-    tcp_port: int = 10000
+-    rpc_port: int = 41451
+-    port_release_wait: float = 10
+-    kill_wait: float = 5
+-    tcp_ready_timeout: float = 30
+-    rpc_ready_timeout: float = 120
+-    poll_interval: float = 0.2
+-    settings: str = "/data/airsim/settings.json"
+-
+-    def __post_init__(self):
+-        if not re.fullmatch(r":[1-9][0-9]{0,4}", self.display):
+-            raise ValueError("display must be an explicit X11 display such as :100")
+-        if not all(type(p) is int and 1 <= p <= 65535 for p in (self.tcp_port, self.rpc_port)):
+-            raise ValueError("invalid scene port")
+-        if self.tcp_port == self.rpc_port:
+-            raise ValueError("scene ports must differ")
+-        for field in ("port_release_wait", "kill_wait", "tcp_ready_timeout", "rpc_ready_timeout", "poll_interval"):
+-            value = getattr(self, field)
+-            if not math.isfinite(value) or not 0 < value <= 600:
+-                raise ValueError(f"invalid {field}")
+ 
+ class EnvironmentService:
+-    def __init__(self, root, config, weather):
+-        self.config, self.weather = config, weather
+-        self.startup_weather = AirSimWeatherService(weather.host, weather.port, 30)
+-        self.root = Path(root).resolve()
++    def __init__(self, settings: Settings, weather: AirSimWeatherService):
++        self.settings = settings
++        self.weather = weather
++        self.startup_weather = AirSimWeatherService(LOOPBACK, weather.port, 30)
++        self.root = settings.root
+         self.runtime = None
+         self.gate = threading.Lock()
+         self.state_lock = threading.Lock()
+@@ -57,9 +38,21 @@ class EnvironmentService:
+         self.lease = None
+         self.process = None
+         self.process_identity = None
+-        self.state = dict(manager_id=str(uuid.uuid4()), revision=0, phase="idle", scene=None, target_scene=None, previous_scene=None,
+-                          instance_id=None, operation_id=None, weather=None, error=None, cleanup=[],
+-                          stage="请选择一个场景启动", completed_operation_id=None)
++        self.state = dict(
++            manager_id=str(uuid.uuid4()),
++            revision=0,
++            phase="idle",
++            scene=None,
++            target_scene=None,
++            previous_scene=None,
++            instance_id=None,
++            operation_id=None,
++            weather=None,
++            error=None,
++            cleanup=[],
++            stage="请选择一个场景启动",
++            completed_operation_id=None,
++        )
+ 
+     def _set(self, **values):
+         with self.state_lock:
+@@ -69,21 +62,29 @@ class EnvironmentService:
+     def snapshot(self, refresh=True):
+         with self.state_lock:
+             state = dict(self.state)
+-        tcp = port_alive(self.config.tcp_port)
+-        rpc = port_alive(self.config.rpc_port)
+-        if refresh and state["phase"] == "ready" and not (tcp and rpc):
++        xpra = port_alive(self.settings.xpra_port)
++        rpc = port_alive(self.settings.rpc_port)
++        if refresh and state["phase"] == "ready" and not (xpra and rpc):
+             # Do not race a switch that started during the probe.
+             with self.state_lock:
+-                if self.state["phase"] == "ready" and self.state["instance_id"] == state["instance_id"]:
++                if (
++                    self.state["phase"] == "ready"
++                    and self.state["instance_id"] == state["instance_id"]
++                ):
+                     self.state["revision"] += 1
+-                    self.state.update(phase="error", scene=None, weather=None,
+-                                      error="场景连接已断开，请重试场景或清理", stage="场景异常退出")
++                    self.state.update(
++                        phase="error",
++                        scene=None,
++                        weather=None,
++                        error="场景连接已断开，请重试场景或清理",
++                        stage="场景异常退出",
++                    )
+                 state = dict(self.state)
+-        return dict(state, port_tcp=tcp, port_rpc=rpc)
++        return dict(state, port_xpra=xpra, port_rpc=rpc)
+ 
+     def _prepare(self):
+         if self.runtime is None:
+-            self.runtime = ProcessRuntime(self.root, self.config)
++            self.runtime = ProcessRuntime(self.settings)
+         if self.lease is None:
+             stream = open(self.runtime.path / "manager.lock", "a+")
+             try:
+@@ -91,12 +92,6 @@ class EnvironmentService:
+             except BlockingIOError:
+                 stream.close()
+                 raise SceneError("另一个场景管理器正在运行")
+-            try:
+-                subprocess.run(self.runtime.sandbox(["/usr/bin/true"]), env=self.runtime.env,
+-                               capture_output=True, timeout=4, check=True)
+-            except (OSError, subprocess.SubprocessError) as error:
+-                stream.close()
+-                raise SceneError("文件系统隔离不可用，未执行场景启停") from error
+             self.lease = stream
+ 
+     def submit(self, scene_id=None, cleanup=False):
+@@ -107,17 +102,32 @@ class EnvironmentService:
+         try:
+             self._prepare()
+             current = self.snapshot()
+-            if not cleanup and current["phase"] == "ready" and current["scene"] == scene_id:
++            if (
++                not cleanup
++                and current["phase"] == "ready"
++                and current["scene"] == scene_id
++            ):
+                 holders = self.runtime.holders()
+-                if not holders or any(key != scene_id for key,_ in holders.values()):
++                if not holders or any(key != scene_id for key, _ in holders.values()):
+                     raise SceneError("当前监听进程与所选场景不匹配")
+                 self.gate.release()
+                 return current, False
+             operation = str(uuid.uuid4())
+-            self._set(phase="stopping", target_scene=scene_id, previous_scene=current["scene"],
+-                      operation_id=operation, error=None, cleanup=[], stage="正在检查和停止旧场景")
+-            self.worker = threading.Thread(target=self._run, args=(scene_id, cleanup),
+-                                           daemon=True, name="scene-switch")
++            self._set(
++                phase="stopping",
++                target_scene=scene_id,
++                previous_scene=current["scene"],
++                operation_id=operation,
++                error=None,
++                cleanup=[],
++                stage="正在检查和停止旧场景",
++            )
++            self.worker = threading.Thread(
++                target=self._run,
++                args=(scene_id, cleanup),
++                daemon=True,
++                name="scene-switch",
++            )
+             self.worker.start()
+             return self.snapshot(False), True
+         except Exception:
+@@ -135,24 +145,18 @@ class EnvironmentService:
+         while time.monotonic() < deadline:
+             self._check_cancel()
+             if self.process and self.process.poll() is not None:
+-                raise SceneError(f"启动进程已退出（{self.process.returncode}），请检查 .runtime/logs/launcher.log")
++                raise SceneError(
++                    f"启动进程已退出（{self.process.returncode}），请检查 .runtime/logs/launcher.log"
++                )
+             try:
+                 if condition():
+                     return
+             except (WeatherUnavailable, subprocess.TimeoutExpired) as error:
+                 last_error = error
+-            time.sleep(self.config.poll_interval)
+-        raise SceneError(f"{description}超时" + (f"：{last_error}" if last_error else ""))
+-
+-    def _write_settings(self):
+-        settings = json.loads(Path(self.config.settings).read_text())
+-        if not isinstance(settings, dict):
+-            raise SceneError("settings 必须是 JSON 对象")
+-        settings.update(ApiServerPort=self.config.rpc_port, RpcEnabled=True)
+-        output = self.runtime.path / "settings.json"
+-        temporary = output.with_suffix(".tmp")
+-        temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2))
+-        temporary.replace(output)
++            time.sleep(self.settings.poll_interval)
++        raise SceneError(
++            f"{description}超时" + (f"：{last_error}" if last_error else "")
++        )
+ 
+     def _cleanup_launch(self):
+         if self.process:
+@@ -167,66 +171,113 @@ class EnvironmentService:
+             self.process = None
+             self.process_identity = None
+ 
++    # --- one switch: stop whatever runs, launch the target, wait until usable ----
++
+     def _run(self, scene_id, cleanup):
+         launched = False
+         try:
+             if not cleanup:
+-                scene = SCENES[scene_id]
+-                if not Path(scene.executable).is_file() or not os.access(scene.executable, os.X_OK):
+-                    raise SceneError(f"场景程序缺失或无执行权限：{scene.name}")
+-                # Preflight before touching the previous scene.
+-                source = json.loads(Path(self.config.settings).read_text())
+-                if not isinstance(source, dict):
+-                    raise SceneError("settings 必须是 JSON 对象，未停止旧场景")
+-                if not Path("/usr/bin/bwrap").is_file():
+-                    raise SceneError("缺少 bwrap，无法保证目录外只读；未停止旧场景")
+-            _, stop = get_commands(scene_id or next(iter(SCENES)), self.config, self.runtime.path)
+-            actions = self.runtime.stop(stop)
+-            self._set(cleanup=actions)
+-            self._cleanup_launch()
+-            self._set(scene=None, instance_id=None, weather=None)
++                self._check_scene_files(scene_id)
++            self._stop_current(scene_id)
+             if cleanup:
+-                self._set(phase="idle", target_scene=None, stage="清理完成", error=None,
+-                          completed_operation_id=self.state["operation_id"])
++                self._set(
++                    phase="idle",
++                    target_scene=None,
++                    stage="清理完成",
++                    error=None,
++                    completed_operation_id=self.state["operation_id"],
++                )
+                 return
+             self._check_cancel()
+-            self._write_settings()
+-            instance = str(uuid.uuid4())
+-            self._set(phase="starting", instance_id=instance, stage=f"正在启动 {SCENES[scene_id].name}")
+-            start, _ = get_commands(scene_id, self.config, self.runtime.path)
+-            with open(self.runtime.path / "logs" / "launcher.log", "a") as log:
+-                log.write(f"\n--- {time.time()} {scene_id} {instance} ---\n")
+-                log.flush()
+-                self.process = subprocess.Popen(self.runtime.sandbox(start), env=self.runtime.env,
+-                                                cwd=self.root, stdout=log, stderr=subprocess.STDOUT,
+-                                                stdin=subprocess.DEVNULL, start_new_session=True)
+-                self.process_identity = identity(self.process.pid)
+-                launched = True
+-            self._wait(lambda: port_alive(self.config.tcp_port), self.config.tcp_ready_timeout, "画面端口启动")
+-            self._set(stage="等待目标场景 RPC 与窗口")
+-            def rpc_ready():
+-                if not port_alive(self.config.rpc_port):
+-                    return False
+-                holders = self.runtime.holders()
+-                if not holders or any(key != scene_id for key, _ in holders.values()):
+-                    raise SceneError("监听进程与目标场景不匹配")
+-                self.weather.probe()
+-                return self.runtime.window_ready(scene_id)
+-            self._wait(rpc_ready, self.config.rpc_ready_timeout, "目标场景 RPC 或窗口就绪")
++            launched = self._launch(scene_id)
++            self._wait_ready(scene_id)
+             self._set(phase="initializing", stage="正在初始化晴朗天气")
+             self.startup_weather.apply("clear")
+-            self._set(phase="ready", scene=scene_id, target_scene=None, weather="clear",
+-                      error=None, stage="场景已就绪", completed_operation_id=self.state["operation_id"])
++            self._set(
++                phase="ready",
++                scene=scene_id,
++                target_scene=None,
++                weather="clear",
++                error=None,
++                stage="场景已就绪",
++                completed_operation_id=self.state["operation_id"],
++            )
+         except Exception as error:
+             # Clean only the launch owned by this operation, never an unknown port holder.
+             if launched:
+                 self._cleanup_launch()
+-            self._set(phase="error", target_scene=None, error=str(error)[:1000],
+-                      stage="操作失败，可重试或清理",
+-                      completed_operation_id=self.state["operation_id"])
++            self._set(
++                phase="error",
++                target_scene=None,
++                error=str(error)[:1000],
++                stage="操作失败，可重试或清理",
++                completed_operation_id=self.state["operation_id"],
++            )
+         finally:
+             self.gate.release()
+ 
++    @staticmethod
++    def _check_scene_files(scene_id):
++        scene = SCENES[scene_id]
++        if not Path(scene.executable).is_file() or not os.access(
++            scene.executable, os.X_OK
++        ):
++            raise SceneError(f"场景程序缺失或无执行权限：{scene.name}")
++
++    def _stop_current(self, stop_scene):
++        _, stop = get_commands(
++            stop_scene or next(iter(SCENES)), self.settings, self.runtime.path
++        )
++        actions = self.runtime.stop(stop)
++        self._set(cleanup=actions)
++        self._cleanup_launch()
++        self._set(scene=None, instance_id=None, weather=None)
++
++    def _launch(self, scene_id):
++        instance = str(uuid.uuid4())
++        self._set(
++            phase="starting",
++            instance_id=instance,
++            stage=f"正在启动 {SCENES[scene_id].name}",
++        )
++        start, _ = get_commands(scene_id, self.settings, self.runtime.path)
++        with open(self.runtime.path / "logs" / "launcher.log", "a") as log:
++            log.write(f"\n--- {time.time()} {scene_id} {instance} ---\n")
++            log.flush()
++            self.process = subprocess.Popen(
++                start,
++                env=self.runtime.env,
++                cwd=self.root,
++                stdout=log,
++                stderr=subprocess.STDOUT,
++                stdin=subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            self.process_identity = identity(self.process.pid)
++        return True
++
++    def _wait_ready(self, scene_id):
++        self._wait(
++            lambda: port_alive(self.settings.xpra_port),
++            self.settings.xpra_ready_timeout,
++            "画面端口启动",
++        )
++        self._set(stage="等待目标场景 RPC 与窗口")
++        self._wait(
++            lambda: self._scene_responding(scene_id),
++            self.settings.rpc_ready_timeout,
++            "目标场景 RPC 或窗口就绪",
++        )
++
++    def _scene_responding(self, scene_id):
++        if not port_alive(self.settings.rpc_port):
++            return False
++        holders = self.runtime.holders()
++        if not holders or any(key != scene_id for key, _ in holders.values()):
++            raise SceneError("监听进程与目标场景不匹配")
++        self.weather.probe()
++        return self.runtime.window_ready(scene_id)
++
+     def apply_weather(self, weather, instance_id):
+         if not self.gate.acquire(blocking=False):
+             raise SceneBusy("场景正在切换或天气正在设置")
+@@ -238,10 +289,18 @@ class EnvironmentService:
+                 raise SceneBusy("场景实例已变化，请刷新状态后重试")
+             try:
+                 holders = self.runtime.holders()
+-                if not holders or any(key != state["scene"] for key,_ in holders.values()):
++                if not holders or any(
++                    key != state["scene"] for key, _ in holders.values()
++                ):
+                     raise SceneError("场景监听归属已变化")
+             except SceneError as error:
+-                self._set(phase="error",scene=None,weather=None,error=str(error),stage="场景归属异常")
++                self._set(
++                    phase="error",
++                    scene=None,
++                    weather=None,
++                    error=str(error),
++                    stage="场景归属异常",
++                )
+                 raise SceneBusy(str(error)) from error
+             try:
+                 self.weather.apply(weather)
+@@ -256,10 +315,14 @@ class EnvironmentService:
+     def shutdown(self):
+         self.cancel.set()
+         if self.worker and self.worker.is_alive():
+-            self.worker.join(timeout=self.config.port_release_wait + self.config.kill_wait + 8)
++            self.worker.join(
++                timeout=self.settings.port_release_wait + self.settings.kill_wait + 8
++            )
+         if self.lease is not None and self.gate.acquire(timeout=3):
+             try:
+-                _, stop = get_commands(next(iter(SCENES)), self.config, self.runtime.path)
++                _, stop = get_commands(
++                    next(iter(SCENES)), self.settings, self.runtime.path
++                )
+                 self.runtime.stop(stop)
+                 self._cleanup_launch()
+             except Exception:
+diff --git a/scene_launcher.py b/scene_launcher.py
+index deaf4ec..f3c7081 100644
+--- a/scene_launcher.py
++++ b/scene_launcher.py
+@@ -1,46 +1,83 @@
+ """Trusted scene templates. Only these IDs can be requested by the browser."""
++
+ from dataclasses import dataclass
++import os
+ from pathlib import Path
+ from types import MappingProxyType
+ import shlex
+ 
++
+ @dataclass(frozen=True)
+ class Scene:
+     name: str
+     executable: str
+ 
+-SCENES = MappingProxyType({
+-    name.lower(): Scene(name, f"/data/airsim/{name}/LinuxNoEditor/{name}/Binaries/Linux/{name}")
+-    for name in ("AirSimNH", "AbandonedPark", "MSBuild2018")
+-})
++
++SCENES = MappingProxyType(
++    {
++        name.lower(): Scene(
++            name, f"/data/airsim/{name}/LinuxNoEditor/{name}/Binaries/Linux/{name}"
++        )
++        for name in ("AirSimNH", "AbandonedPark", "MSBuild2018")
++    }
++)
++
+ 
+ # Templates are administrator-controlled argv, never browser-provided shell text.
+-def get_commands(scene_key, config, runtime):
++def get_commands(scene_key, settings, runtime):
+     scene = SCENES[scene_key]
+-    child = [scene.executable, scene.name,
+-             f"-settings={runtime / 'settings.json'}",
+-             f"-userdir={runtime / 'home'}",
+-             f"-abslog={runtime / 'logs' / (scene_key + '.log')}",
+-             "-windowed", "-ResX=1280", "-ResY=720"]
+-    common = [f"--socket-dir={runtime / 'sockets'}",
+-              f"--socket-dirs={runtime / 'sockets'}",
+-              f"--sessions-dir={runtime / 'sessions'}"]
+-    start = ["/usr/bin/xpra", "start", config.display, "--backend=x11",
+-             "--daemon=no", "--use-display=no", "--start-via-proxy=no",
+-             f"--start-child={shlex.join(child)}",
+-             "--exit-with-children=yes", "--terminate-children=yes",
+-             "--sharing=yes", f"--bind-tcp=0.0.0.0:{config.tcp_port}", "--html=on",
+-             "--dbus=no", "--dbus-launch=", "--pulseaudio=no",
+-             "--notifications=no", "--mdns=no", "--printing=no", "--file-transfer=no",
+-             f"--log-dir={runtime / 'logs'}",
+-             f"--pidfile={runtime / 'xpra.pid'}",
+-             "--xvfb=Xvfb -screen 0 1280x720x24 +extension GLX +extension RANDR +extension RENDER +extension Composite -extension DOUBLE-BUFFER -nolisten tcp -noreset",
+-             *common]
+-    endpoint = "socket://" + str(runtime / "sessions" / config.display[1:] / "socket")
++    child = [
++        scene.executable,
++        scene.name,
++        f"-settings={settings.airsim_settings}",
++        f"-abslog={runtime / 'logs' / (scene_key + '.log')}",
++        "-windowed",
++        "-ResX=1280",
++        "-ResY=720",
++    ]
++    common = [
++        f"--socket-dir={runtime / 'sockets'}",
++        f"--socket-dirs={runtime / 'sockets'}",
++        f"--sessions-dir={runtime / 'sessions'}",
++    ]
++    start = [
++        "/usr/bin/xpra",
++        "start",
++        settings.display,
++        "--backend=x11",
++        "--daemon=no",
++        "--use-display=no",
++        "--start-via-proxy=no",
++        f"--start-child={shlex.join(child)}",
++        "--exit-with-children=yes",
++        "--terminate-children=yes",
++        "--sharing=yes",
++        f"--bind-tcp=0.0.0.0:{settings.xpra_port}",
++        "--html=on",
++        "--dbus=no",
++        "--dbus-launch=",
++        "--pulseaudio=no",
++        "--notifications=no",
++        "--mdns=no",
++        "--printing=no",
++        "--file-transfer=no",
++        f"--log-dir={runtime / 'logs'}",
++        f"--pidfile={runtime / 'xpra.pid'}",
++        "--xvfb=Xvfb -screen 0 1280x720x24 +extension GLX +extension RANDR +extension RENDER +extension Composite -extension DOUBLE-BUFFER -nolisten tcp -noreset",
++        *common,
++    ]
++    endpoint = "socket://" + str(runtime / "sessions" / settings.display[1:] / "socket")
+     stop = ["/usr/bin/xpra", "stop", endpoint, *common]
+     return start, stop
+ 
++
+ def scene_list():
+-    return [{"id":key, "name":scene.name,
+-             "available":Path(scene.executable).is_file() and __import__("os").access(scene.executable, 1)}
+-            for key,scene in SCENES.items()]
++    return [
++        {
++            "id": key,
++            "name": scene.name,
++            "available": Path(scene.executable).is_file()
++            and os.access(scene.executable, os.X_OK),
++        }
++        for key, scene in SCENES.items()
++    ]
+diff --git a/scene_processes.py b/scene_processes.py
+index 7540eed..f913066 100644
+--- a/scene_processes.py
++++ b/scene_processes.py
+@@ -1,4 +1,5 @@
+-"""Linux process inspection and a read-only filesystem boundary for the simulator."""
++"""Linux 进程检查：端口持有者、进程归属、受管停止与窗口确认。"""
++
+ from pathlib import Path
+ import os
+ import re
+@@ -8,35 +9,55 @@ import socket
+ import subprocess
+ import time
+ 
++from config import LOOPBACK
++
++
+ class SceneError(Exception):
+     pass
+ 
++
+ def port_alive(port):
+     with socket.socket() as connection:
+         connection.settimeout(0.3)
+-        return connection.connect_ex(("127.0.0.1", port)) == 0
++        return connection.connect_ex((LOOPBACK, port)) == 0
++
+ 
+ def listener_pids(port):
+-    result = subprocess.run(["ss", "-H", "-ltnp", f"sport = :{port}"],
+-                            capture_output=True, text=True, timeout=3, check=True)
++    result = subprocess.run(
++        ["ss", "-H", "-ltnp", f"sport = :{port}"],
++        capture_output=True,
++        text=True,
++        timeout=3,
++        check=True,
++    )
+     pids = set(map(int, re.findall(r"pid=(\d+)", result.stdout)))
+     if port_alive(port) and not pids:
+         raise SceneError(f"端口 {port} 已占用，无法确认监听进程归属")
+     return pids
+ 
++
+ def identity(pid):
+     root = Path("/proc") / str(pid)
+     try:
+         fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+-        return (int(fields[19]), root.stat().st_uid,
+-                os.readlink(root / "exe"),
+-                (root / "cmdline").read_bytes().decode(errors="replace").rstrip("\0").split("\0"))
++        return (
++            int(fields[19]),
++            root.stat().st_uid,
++            os.readlink(root / "exe"),
++            (root / "cmdline")
++            .read_bytes()
++            .decode(errors="replace")
++            .rstrip("\0")
++            .split("\0"),
++        )
+     except (FileNotFoundError, ProcessLookupError, PermissionError):
+         return None
+ 
++
+ def descendants(pid):
+     result = []
+     seen = set()
++
+     def walk(parent):
+         if parent in seen:
+             return
+@@ -56,9 +77,11 @@ def descendants(pid):
+                 result.append((parent, item))
+         except OSError:
+             pass
++
+     walk(pid)
+     return result
+ 
++
+ def kill_verified_tree(pid, expected):
+     if identity(pid) != expected:
+         return []
+@@ -74,32 +97,19 @@ def kill_verified_tree(pid, expected):
+                 pass
+     return killed
+ 
++
+ class ProcessRuntime:
+-    def __init__(self, root, config):
+-        self.root = Path(root).resolve()
++    def __init__(self, settings):
++        self.settings = settings
++        self.root = settings.root
+         self.path = self.root / ".runtime"
+-        self.config = config
+         self.env = dict(os.environ)
+-        for key in ("LD_LIBRARY_PATH", "PYTHONPATH", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+-                    "SESSION_MANAGER", "XPRA_SESSION_DIR"):
+-            self.env.pop(key, None)
+-        for name in ("home", "tmp", "cache", "config", "data", "run", "logs", "sockets", "sessions"):
++        for name in ("logs", "sockets", "sessions"):
+             (self.path / name).mkdir(parents=True, exist_ok=True)
+-        os.chmod(self.path / "run", 0o700)
+-        self.env.update(HOME=str(self.path / "home"), TMPDIR=str(self.path / "tmp"),
+-                        XDG_RUNTIME_DIR=str(self.path / "run"), XDG_CACHE_HOME=str(self.path / "cache"),
+-                        XDG_CONFIG_HOME=str(self.path / "config"), XDG_DATA_HOME=str(self.path / "data"),
+-                        PATH="/usr/bin:/bin", XPRA_SHARED_XAUTHORITY="0",
+-                        XPRA_SOCKET_DIR=str(self.path / "sockets"))
+-
+-    def sandbox(self, args):
+-        # External installations remain read-only. X11 /tmp files live only in this namespace.
+-        return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--bind", str(self.root), str(self.root),
+-                "--tmpfs", "/tmp", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
+-                "--proc", "/proc", "--chdir", str(self.root), "--", *args]
+ 
+     def owned_scene(self, pid):
+         from scene_launcher import SCENES
++
+         info = identity(pid)
+         if not info or info[1] != os.getuid():
+             return None
+@@ -110,69 +120,122 @@ class ProcessRuntime:
+                 argv = shlex.split(argv[0])
+             except ValueError:
+                 return None
+-        marker = f"-settings={self.path / 'settings.json'}"
++        marker = f"-settings={self.settings.airsim_settings}"
+         for key, scene in SCENES.items():
+             if exe == scene.executable and marker in argv:
+                 return key
+-        if (exe == os.path.realpath("/usr/bin/python3") and "/usr/bin/xpra" in argv and "start" in argv and self.config.display in argv
+-                and f"--socket-dir={self.path / 'sockets'}" in argv):
++        if (
++            exe == os.path.realpath("/usr/bin/python3")
++            and "/usr/bin/xpra" in argv
++            and "start" in argv
++            and self.settings.display in argv
++            and f"--socket-dir={self.path / 'sockets'}" in argv
++        ):
+             for key, scene in SCENES.items():
+-                if any(arg.startswith("--start-child=") and scene.executable in arg for arg in argv):
++                if any(
++                    arg.startswith("--start-child=") and scene.executable in arg
++                    for arg in argv
++                ):
+                     return key
+         return None
+ 
+     def holders(self):
+         holders = {}
+-        for port in (self.config.tcp_port, self.config.rpc_port):
++        for port in (self.settings.xpra_port, self.settings.rpc_port):
+             for pid in listener_pids(port):
+                 key = self.owned_scene(pid)
+                 if not key:
+                     info = identity(pid)
+                     command = " ".join(info[3])[:350] if info else "exited"
+-                    raise SceneError(f"端口 {port} 属于未受管进程 PID {pid}: {command}；未执行清理")
++                    raise SceneError(
++                        f"端口 {port} 属于未受管进程 PID {pid}: {command}；未执行清理"
++                    )
+                 holders[pid] = (key, identity(pid))
+         return holders
+ 
+     def stop(self, stop_args):
+         holders = self.holders()  # Validate every holder before taking any action.
+         killed = []
+-        actions = [{"pid":pid,"scene":key,"action":"xpra_stop"} for pid,(key,_) in holders.items()]
++        actions = [
++            {"pid": pid, "scene": key, "action": "xpra_stop"}
++            for pid, (key, _) in holders.items()
++        ]
+         if not holders:
+             return killed
+         try:
+-            subprocess.run(self.sandbox(stop_args), env=self.env, cwd=self.root,
+-                           capture_output=True, timeout=self.config.port_release_wait + 2)
++            subprocess.run(
++                stop_args,
++                env=self.env,
++                cwd=self.root,
++                capture_output=True,
++                timeout=self.settings.port_release_wait + 2,
++            )
+         except subprocess.TimeoutExpired:
+             pass
+-        deadline = time.monotonic() + self.config.port_release_wait
++        deadline = time.monotonic() + self.settings.port_release_wait
+         while time.monotonic() < deadline:
+-            if not any(port_alive(p) for p in (self.config.tcp_port, self.config.rpc_port)):
+-                return actions + [{"pid":pid,"action":"killed"} for pid in killed]
+-            time.sleep(self.config.poll_interval)
++            if not any(
++                port_alive(p) for p in (self.settings.xpra_port, self.settings.rpc_port)
++            ):
++                return actions + [{"pid": pid, "action": "killed"} for pid in killed]
++            time.sleep(self.settings.poll_interval)
+         # Re-read and revalidate ownership, including PID identity, before a forced kill.
+         for pid, (_, before) in self.holders().items():
+             killed.extend(kill_verified_tree(pid, before))
+-        deadline = time.monotonic() + self.config.kill_wait
++        deadline = time.monotonic() + self.settings.kill_wait
+         while time.monotonic() < deadline:
+-            if not any(port_alive(p) for p in (self.config.tcp_port, self.config.rpc_port)):
+-                return actions + [{"pid":pid,"action":"killed"} for pid in killed]
+-            time.sleep(self.config.poll_interval)
++            if not any(
++                port_alive(p) for p in (self.settings.xpra_port, self.settings.rpc_port)
++            ):
++                return actions + [{"pid": pid, "action": "killed"} for pid in killed]
++            time.sleep(self.settings.poll_interval)
+         self.holders()
+         raise SceneError("停止超时，画面或 RPC 端口仍被占用")
+ 
+     def window_ready(self, scene):
+-        result = subprocess.run(self.sandbox(["/usr/bin/xpra", "info", "socket://" + str(self.path / "sessions" / self.config.display[1:] / "socket"),
+-                    f"--socket-dir={self.path / 'sockets'}", f"--socket-dirs={self.path / 'sockets'}"]),
+-                    env=self.env, capture_output=True, text=True, timeout=4)
+-        for match in re.finditer(r"^windows\.([^.]+)\.pid=(\d+)$", result.stdout, re.MULTILINE):
++        result = subprocess.run(
++            [
++                "/usr/bin/xpra",
++                "info",
++                "socket://"
++                + str(self.path / "sessions" / self.settings.display[1:] / "socket"),
++                f"--socket-dir={self.path / 'sockets'}",
++                f"--socket-dirs={self.path / 'sockets'}",
++            ],
++            env=self.env,
++            capture_output=True,
++            text=True,
++            timeout=4,
++        )
++        for match in re.finditer(
++            r"^windows\.([^.]+)\.pid=(\d+)$", result.stdout, re.MULTILINE
++        ):
+             wid, pid = match.group(1), int(match.group(2))
+             if self.owned_scene(pid) == scene:
+                 # Seamless xpra leaves windows unmapped until a client attaches.
+                 # Vulkan can then block the game thread, including weather RPC.
+                 for command in ("map", "focus"):
+-                    response = subprocess.run(self.sandbox(["/usr/bin/xpra", "control", "socket://" + str(self.path / "sessions" / self.config.display[1:] / "socket"),
+-                        f"--socket-dir={self.path / 'sockets'}", f"--socket-dirs={self.path / 'sockets'}",
+-                        command, wid]), env=self.env, capture_output=True, text=True, timeout=4)
++                    response = subprocess.run(
++                        [
++                            "/usr/bin/xpra",
++                            "control",
++                            "socket://"
++                            + str(
++                                self.path
++                                / "sessions"
++                                / self.settings.display[1:]
++                                / "socket"
++                            ),
++                            f"--socket-dir={self.path / 'sockets'}",
++                            f"--socket-dirs={self.path / 'sockets'}",
++                            command,
++                            wid,
++                        ],
++                        env=self.env,
++                        capture_output=True,
++                        text=True,
++                        timeout=4,
++                    )
+                     if response.returncode:
+                         return False
+                 return True
+diff --git a/static/app.js b/static/app.js
+index 5c15916..6c4c479 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -1,36 +1,53 @@
+ const icons = {
+-  dashboard:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+-  route:'<circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M7 5h8a4 4 0 0 1 0 8H9a4 4 0 0 0 0 8h5"/>',
+-  folder:'<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/>',
+-  link:'<path d="m10 7 2-2a5 5 0 0 1 7 7l-2 2m-3 3-2 2a5 5 0 0 1-7-7l2-2m2 5 6-6"/>',
+-  signal:'<path d="M4 20v-3m5 3v-7m5 7V9m5 11V4"/>',
+-  navigation:'<path d="m12 3 8 18-8-4-8 4Z"/>',
+-  camera:'<path d="m8 6 2-3h4l2 3h4a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13" r="4"/>',
+-  focus:'<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><circle cx="12" cy="12" r="3"/>',
+-  expand:'<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M3 3l6 6m12-6-6 6M3 21l6-6m12 6-6-6"/>',
+-  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
+-  cloud:'<path d="M6 18a5 5 0 1 1 1-10 6 6 0 0 1 11 2 4 4 0 1 1 0 8Z"/>',
+-  rain:'<path d="M5 15a4 4 0 1 1 2-8 5 5 0 0 1 10 1 4 4 0 0 1 2 7M8 18l-1 3m6-3-1 3m6-3-1 3"/>',
+-  snow:'<path d="M12 2v20M3.3 7l17.4 10M3.3 17 20.7 7M9 4l3 3 3-3M9 20l3-3 3 3M4 10l4-1-1-4m13 9-4 1 1 4M4 14l4 1-1 4m13-9-4-1 1-4"/>',
+-  fog:'<path d="M4 9h16M2 13h14m3 0h3M5 17h14M8 5h8"/>',
+-  terminal:'<path d="m4 7 5 5-5 5m8 0h8"/>',
+-  arrow:'<path d="M4 12h16m-6-6 6 6-6 6"/>',
+-  shield:'<path d="M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6Z"/><path d="m8 12 3 3 5-6"/>',
+-  sliders:'<path d="M5 3v5m0 4v9M12 3v10m0 4v4M19 3v3m0 4v11M2 8h6m1 9h6m1-11h6"/>',
+-  info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/>',
+-  close:'<path d="m6 6 12 12M6 18 18 6"/>'
++  dashboard:
++    '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
++  route:
++    '<circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M7 5h8a4 4 0 0 1 0 8H9a4 4 0 0 0 0 8h5"/>',
++  folder:
++    '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/>',
++  link: '<path d="m10 7 2-2a5 5 0 0 1 7 7l-2 2m-3 3-2 2a5 5 0 0 1-7-7l2-2m2 5 6-6"/>',
++  signal: '<path d="M4 20v-3m5 3v-7m5 7V9m5 11V4"/>',
++  navigation: '<path d="m12 3 8 18-8-4-8 4Z"/>',
++  camera:
++    '<path d="m8 6 2-3h4l2 3h4a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13" r="4"/>',
++  focus:
++    '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><circle cx="12" cy="12" r="3"/>',
++  expand:
++    '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M3 3l6 6m12-6-6 6M3 21l6-6m12 6-6-6"/>',
++  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
++  cloud: '<path d="M6 18a5 5 0 1 1 1-10 6 6 0 0 1 11 2 4 4 0 1 1 0 8Z"/>',
++  rain: '<path d="M5 15a4 4 0 1 1 2-8 5 5 0 0 1 10 1 4 4 0 0 1 2 7M8 18l-1 3m6-3-1 3m6-3-1 3"/>',
++  snow: '<path d="M12 2v20M3.3 7l17.4 10M3.3 17 20.7 7M9 4l3 3 3-3M9 20l3-3 3 3M4 10l4-1-1-4m13 9-4 1 1 4M4 14l4 1-1 4m13-9-4-1 1-4"/>',
++  fog: '<path d="M4 9h16M2 13h14m3 0h3M5 17h14M8 5h8"/>',
++  terminal: '<path d="m4 7 5 5-5 5m8 0h8"/>',
++  arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
++  shield:
++    '<path d="M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6Z"/><path d="m8 12 3 3 5-6"/>',
++  sliders:
++    '<path d="M5 3v5m0 4v9M12 3v10m0 4v4M19 3v3m0 4v11M2 8h6m1 9h6m1-11h6"/>',
++  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/>',
++  close: '<path d="m6 6 12 12M6 18 18 6"/>',
+ };
+-const icon = name => `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name] || icons.info}</svg>`;
+-const renderIcons = (root = document) => root.querySelectorAll('[data-icon]').forEach(el => el.innerHTML = icon(el.dataset.icon));
++const icon = (name) =>
++  `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name] || icons.info}</svg>`;
++const renderIcons = (root = document) =>
++  root
++    .querySelectorAll("[data-icon]")
++    .forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
+ renderIcons();
+-const $ = s => document.querySelector(s);
+-const viewport = $('#viewport');
++const $ = (s) => document.querySelector(s);
++const viewport = $("#viewport");
+ let toastTimer;
+-function toast(message) { $('#toast').textContent = message; $('#toast').classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('visible'), 3600); }
++function toast(message) {
++  $("#toast").textContent = message;
++  $("#toast").classList.add("visible");
++  clearTimeout(toastTimer);
++  toastTimer = setTimeout(() => $("#toast").classList.remove("visible"), 3600);
++}
+ const DEFAULT_XPRA_URL = document.body.dataset.xpraUrl;
+-const SCENE_CONTROL = document.body.dataset.sceneControl === 'true';
++const SCENE_CONTROL = document.body.dataset.sceneControl === "true";
+ let sceneBusy = false;
+-let scenePhase = 'idle';
++let scenePhase = "idle";
+ let sceneInstance = null;
+ let lastReadyInstance = null;
+ let sceneRequestPending = false;
+@@ -38,188 +55,420 @@ let scenePollPending = false;
+ let sceneRevision = -1;
+ let sceneManagerId = null;
+ let remoteActive = false;
+-let activeXpraUrl = '';
++let activeXpraUrl = "";
+ let connectionTimer;
+ function normalizeXpraUrl(value) {
+-  const text=value.trim();
+-  if(!text) throw new Error('请输入 xpra 网页地址');
+-  const url=new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text)?text:'http://'+text);
+-  if(!['http:','https:'].includes(url.protocol)) throw new Error('请输入 http 或 https 网页地址，不能填写 WebSocket 地址');
+-  if(url.username || url.password || url.searchParams.has('password') || url.searchParams.has('token')) throw new Error('请勿在地址中保存凭据；如需认证，请使用 xpra 自身的登录界面');
+-  if(location.protocol==='https:' && url.protocol==='http:') throw new Error('当前网页使用 HTTPS，需使用 HTTPS 的 xpra 地址，或在本地 HTTP 页面中连接');
+-  url.hash='';
++  const text = value.trim();
++  if (!text) throw new Error("请输入 xpra 网页地址");
++  const url = new URL(
++    /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : "http://" + text,
++  );
++  if (!["http:", "https:"].includes(url.protocol))
++    throw new Error("请输入 http 或 https 网页地址，不能填写 WebSocket 地址");
++  if (
++    url.username ||
++    url.password ||
++    url.searchParams.has("password") ||
++    url.searchParams.has("token")
++  )
++    throw new Error(
++      "请勿在地址中保存凭据；如需认证，请使用 xpra 自身的登录界面",
++    );
++  if (location.protocol === "https:" && url.protocol === "http:")
++    throw new Error(
++      "当前网页使用 HTTPS，需使用 HTTPS 的 xpra 地址，或在本地 HTTP 页面中连接",
++    );
++  url.hash = "";
+   return url;
+ }
+-function connectXpra(value, remember=true) {
+-  const base=normalizeXpraUrl(value);
+-  const url=new URL(base);
++function connectXpra(value, remember = true) {
++  const base = normalizeXpraUrl(value);
++  const url = new URL(base);
+   // Xpra rejects steal=false before checking sharing. Require server sharing=yes for concurrent clients.
+-  Object.entries({floating_menu:'false',border:'no',clipboard:'false',printing:'false',file_transfer:'false',sound:'false',keyboard:'false',steal:'true',sharing:'true'}).forEach(([key,value])=>url.searchParams.set(key,value));
+-  if(remember) {try {localStorage.setItem('aerolyte-xpra-url',base.href);} catch {toast('浏览器未允许保存地址，本次连接仍可使用');}}
+-  activeXpraUrl=base.href;
+-  remoteActive=true;
+-  const frame=$('#xpra-frame');
++  Object.entries({
++    floating_menu: "false",
++    border: "no",
++    clipboard: "false",
++    printing: "false",
++    file_transfer: "false",
++    sound: "false",
++    keyboard: "false",
++    steal: "true",
++    sharing: "true",
++  }).forEach(([key, value]) => url.searchParams.set(key, value));
++  if (remember) {
++    try {
++      localStorage.setItem("aerolyte-xpra-url", base.href);
++    } catch {
++      toast("浏览器未允许保存地址，本次连接仍可使用");
++    }
++  }
++  activeXpraUrl = base.href;
++  remoteActive = true;
++  const frame = $("#xpra-frame");
+   clearTimeout(connectionTimer);
+-  viewport.classList.add('remote-mode'); frame.hidden=false;
+-  $('#view-mode-label').textContent='xpra 远程窗口';
+-  $('#connect-label').textContent='连接设置';
+-  $('#feed-status').textContent='正在打开 xpra 客户端…';
+-  $('#open-feed').href=url.href;
+-  $('.feed-actions').hidden=false;
+-  frame.src=url.href;
+-  connectionTimer=setTimeout(()=>{
+-    if(remoteActive) $('#feed-status').textContent='若无画面，请独立打开检查连接';
+-  },15000);
++  viewport.classList.add("remote-mode");
++  frame.hidden = false;
++  $("#view-mode-label").textContent = "xpra 远程窗口";
++  $("#connect-label").textContent = "连接设置";
++  $("#feed-status").textContent = "正在打开 xpra 客户端…";
++  $("#open-feed").href = url.href;
++  $(".feed-actions").hidden = false;
++  frame.src = url.href;
++  connectionTimer = setTimeout(() => {
++    if (remoteActive)
++      $("#feed-status").textContent = "若无画面，请独立打开检查连接";
++  }, 15000);
+ }
+ function disconnectXpra() {
+-  remoteActive=false; clearTimeout(connectionTimer);
+-  $('#xpra-frame').hidden=true; $('#xpra-frame').removeAttribute('src');
+-  viewport.classList.remove('remote-mode');
+-  $('#view-mode-label').textContent='画面未连接'; $('#feed-status').textContent='画面已断开，可通过连接设置重新连接';
+-  $('#connect-label').textContent='连接 AirSim'; $('.feed-actions').hidden=true;
++  remoteActive = false;
++  clearTimeout(connectionTimer);
++  $("#xpra-frame").hidden = true;
++  $("#xpra-frame").removeAttribute("src");
++  viewport.classList.remove("remote-mode");
++  $("#view-mode-label").textContent = "画面未连接";
++  $("#feed-status").textContent = "画面已断开，可通过连接设置重新连接";
++  $("#connect-label").textContent = "连接 AirSim";
++  $(".feed-actions").hidden = true;
+ }
+-$('#xpra-frame').addEventListener('load',()=>{
+-  if(!remoteActive) return;
++$("#xpra-frame").addEventListener("load", () => {
++  if (!remoteActive) return;
+   // A cross-origin iframe load does not verify the WebSocket or the AirSim session.
+-  $('#feed-status').textContent='xpra 嵌入模式 · 连接结果以画面为准';
++  $("#feed-status").textContent = "xpra 嵌入模式 · 连接结果以画面为准";
+ });
+-$('#retry-feed').addEventListener('click',()=>{try {connectXpra(activeXpraUrl,false);} catch(error) {toast(error.message);}});
+-$('#disconnect-feed').addEventListener('click',disconnectXpra);
+-function focusAirSim(force=false) {
+-  if (!remoteActive || modal.open || (SCENE_CONTROL && scenePhase !== 'ready')) return;
+-  const frame = $('#xpra-frame');
++$("#retry-feed").addEventListener("click", () => {
++  try {
++    connectXpra(activeXpraUrl, false);
++  } catch (error) {
++    toast(error.message);
++  }
++});
++$("#disconnect-feed").addEventListener("click", disconnectXpra);
++function focusAirSim(force = false) {
++  if (!remoteActive || modal.open || (SCENE_CONTROL && scenePhase !== "ready"))
++    return;
++  const frame = $("#xpra-frame");
+   const active = document.activeElement;
+   // Do not interrupt typing or another action performed while the RPC was pending.
+-  if (!force && active && active !== document.body && active !== frame && !$('#weather-list').contains(active)) return;
+-  frame.focus({preventScroll:true});
++  if (
++    !force &&
++    active &&
++    active !== document.body &&
++    active !== frame &&
++    !$("#weather-list").contains(active)
++  )
++    return;
++  frame.focus({ preventScroll: true });
+   // Window.focus is permitted for a cross-origin iframe; do not inspect its DOM.
+   frame.contentWindow?.focus();
+ }
+-$('#focus-feed').addEventListener('click', () => focusAirSim(true));
++$("#focus-feed").addEventListener("click", () => focusAirSim(true));
+ 
+ const options = {
+   scene: [
+-    {id:'airsimnh',name:'AirSimNH',detail:'AirSimNH',available:true},
+-    {id:'abandonedpark',name:'AbandonedPark',detail:'AbandonedPark',available:true},
+-    {id:'msbuild2018',name:'MSBuild2018',detail:'MSBuild2018',available:true}
++    { id: "airsimnh", name: "AirSimNH", detail: "AirSimNH", available: true },
++    {
++      id: "abandonedpark",
++      name: "AbandonedPark",
++      detail: "AbandonedPark",
++      available: true,
++    },
++    {
++      id: "msbuild2018",
++      name: "MSBuild2018",
++      detail: "MSBuild2018",
++      available: true,
++    },
+   ],
+-  weather: Object.freeze([{id:'clear', name:'晴朗', detail:'Clear skies', preset:'sun'}, {id:'rain', name:'雨天', detail:'Rain', preset:'rain'}, {id:'fog', name:'雾天', detail:'Fog', preset:'fog'}, {id:'snow', name:'雪天', detail:'Snow', preset:'snow'}])
++  weather: Object.freeze([
++    { id: "clear", name: "晴朗", detail: "Clear skies", preset: "sun" },
++    { id: "rain", name: "雨天", detail: "Rain", preset: "rain" },
++    { id: "fog", name: "雾天", detail: "Fog", preset: "fog" },
++    { id: "snow", name: "雪天", detail: "Snow", preset: "snow" },
++  ]),
+ };
+-const selected = {scene:null, weather:null};
++const selected = { scene: null, weather: null };
+ let weatherPending = false;
+ let weatherInitialized = false;
+ function renderList(type) {
+-  const list = $('#'+type+'-list');
++  const list = $("#" + type + "-list");
+   list.replaceChildren();
+-  options[type].forEach(item => {
+-    const button=document.createElement('button');
+-    button.className='scene-button option-button'+(selected[type]===item.id?' selected':'');
+-    button.setAttribute('aria-pressed',String(selected[type]===item.id));
+-    button.dataset.option=item.id;
+-    if(type==='weather') button.disabled=weatherPending || (SCENE_CONTROL && scenePhase !== 'ready');
+-    else button.disabled=sceneBusy || !item.available || !SCENE_CONTROL;
+-    const thumb=document.createElement('span');
+-    thumb.className='weather-symbol';
+-    thumb.innerHTML=icon(type==='weather'?item.preset:'folder');
+-    const label=document.createElement('span');
+-    label.className='option-label';
+-    const name=document.createElement('b'); name.textContent=item.name;
+-    const detail=document.createElement('small'); detail.textContent=item.detail;
+-    label.append(name,detail);
+-    const indicator=document.createElement('span'); indicator.className='selection-indicator';
+-    button.append(thumb,label,indicator);
+-    button.addEventListener('click',()=>{
+-      if(type==='weather') {applyWeather(item, true); return;}
++  options[type].forEach((item) => {
++    const button = document.createElement("button");
++    button.className =
++      "scene-button option-button" +
++      (selected[type] === item.id ? " selected" : "");
++    button.setAttribute("aria-pressed", String(selected[type] === item.id));
++    button.dataset.option = item.id;
++    if (type === "weather")
++      button.disabled =
++        weatherPending || (SCENE_CONTROL && scenePhase !== "ready");
++    else button.disabled = sceneBusy || !item.available || !SCENE_CONTROL;
++    const thumb = document.createElement("span");
++    thumb.className = "weather-symbol";
++    thumb.innerHTML = icon(type === "weather" ? item.preset : "folder");
++    const label = document.createElement("span");
++    label.className = "option-label";
++    const name = document.createElement("b");
++    name.textContent = item.name;
++    const detail = document.createElement("small");
++    detail.textContent = item.detail;
++    label.append(name, detail);
++    const indicator = document.createElement("span");
++    indicator.className = "selection-indicator";
++    button.append(thumb, label, indicator);
++    button.addEventListener("click", () => {
++      if (type === "weather") {
++        applyWeather(item, true);
++        return;
++      }
+       switchScene(item.id);
+     });
+     list.append(button);
+   });
+-  $('#'+type+'-count').textContent=String(options[type].length).padStart(2,'0')+' 项';
++  $("#" + type + "-count").textContent =
++    String(options[type].length).padStart(2, "0") + " 项";
+ }
+-async function applyWeather(item, restoreInput=false) {
+-  if(weatherPending || (SCENE_CONTROL && (sceneBusy || scenePhase !== 'ready'))) return;
++async function applyWeather(item, restoreInput = false) {
++  if (
++    weatherPending ||
++    (SCENE_CONTROL && (sceneBusy || scenePhase !== "ready"))
++  )
++    return;
+   const requestInstance = sceneInstance;
+-  weatherPending=true;
+-  const list=$('#weather-list'); const position=list.scrollTop;
+-  const status=$('#weather-status');
+-  status.textContent='正在切换至「'+item.name+'」…'; status.dataset.state='pending';
+-  list.setAttribute('aria-busy','true'); renderList('weather'); list.scrollTop=position;
+-  const controller=new AbortController();
+-  const timer=setTimeout(()=>controller.abort(),35000);
++  weatherPending = true;
++  const list = $("#weather-list");
++  const position = list.scrollTop;
++  const status = $("#weather-status");
++  status.textContent = "正在切换至「" + item.name + "」…";
++  status.dataset.state = "pending";
++  list.setAttribute("aria-busy", "true");
++  renderList("weather");
++  list.scrollTop = position;
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), 35000);
+   try {
+-    const response=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weather:item.id,...(SCENE_CONTROL?{instance_id:requestInstance}:{})}),signal:controller.signal});
+-    const result=await response.json();
+-    if(!response.ok || result.status!=='applied' || result.weather!==item.id) throw new Error(result.message || '天气切换失败，请检查 AirSim 连接');
+-    if (SCENE_CONTROL && (requestInstance !== sceneInstance || result.instance_id !== requestInstance)) return;
+-    selected.weather=item.id;
+-    weatherInitialized=true;
+-    status.textContent='已应用：'+item.name; status.dataset.state='success';
+-    toast('已将 AirSim 天气切换为「'+item.name+'」');
+-  } catch(error) {
++    const response = await fetch("/api/weather", {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({
++        weather: item.id,
++        ...(SCENE_CONTROL ? { instance_id: requestInstance } : {}),
++      }),
++      signal: controller.signal,
++    });
++    const result = await response.json();
++    if (
++      !response.ok ||
++      result.status !== "applied" ||
++      result.weather !== item.id
++    )
++      throw new Error(result.message || "天气切换失败，请检查 AirSim 连接");
++    if (
++      SCENE_CONTROL &&
++      (requestInstance !== sceneInstance ||
++        result.instance_id !== requestInstance)
++    )
++      return;
++    selected.weather = item.id;
++    weatherInitialized = true;
++    status.textContent = "已应用：" + item.name;
++    status.dataset.state = "success";
++    toast("已将 AirSim 天气切换为「" + item.name + "」");
++  } catch (error) {
+     if (SCENE_CONTROL && requestInstance !== sceneInstance) return;
+-    selected.weather=null;
+-    const message=error.name==='AbortError'?'请求超时，天气状态未确认，请重试':error instanceof SyntaxError?'服务返回异常，请检查 Flask 是否正常运行':error.message;
+-    status.textContent=message; status.dataset.state='error'; toast(message);
++    selected.weather = null;
++    const message =
++      error.name === "AbortError"
++        ? "请求超时，天气状态未确认，请重试"
++        : error instanceof SyntaxError
++          ? "服务返回异常，请检查 Flask 是否正常运行"
++          : error.message;
++    status.textContent = message;
++    status.dataset.state = "error";
++    toast(message);
+   } finally {
+-    clearTimeout(timer); weatherPending=false; list.setAttribute('aria-busy','false'); renderList('weather'); list.scrollTop=position;
+-    if (restoreInput && (!SCENE_CONTROL || requestInstance === sceneInstance)) focusAirSim();
++    clearTimeout(timer);
++    weatherPending = false;
++    list.setAttribute("aria-busy", "false");
++    renderList("weather");
++    list.scrollTop = position;
++    if (restoreInput && (!SCENE_CONTROL || requestInstance === sceneInstance))
++      focusAirSim();
+   }
+ }
+-renderList('scene'); renderList('weather');
+-document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => { $('#command').value = button.dataset.command; $('#command').focus(); }));
++renderList("scene");
++renderList("weather");
++document.querySelectorAll("[data-command]").forEach((button) =>
++  button.addEventListener("click", () => {
++    $("#command").value = button.dataset.command;
++    $("#command").focus();
++  }),
++);
+ const history = [];
+-$('#command-form').addEventListener('submit', e => { e.preventDefault(); const command = $('#command').value.trim(); if (!command) { $('#command').focus(); toast('请输入飞行任务，或选择一条快捷指令'); return; } history.unshift({ command, time: new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); $('#command-feedback').textContent = `已记录「${command}」。当前为 UI 演示，指令尚未发送至无人机。`; $('#command').value = ''; });
+-$('#fullscreen').addEventListener('click', async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await viewport.requestFullscreen(); } catch { toast('当前预览环境不支持全屏，请在独立浏览器中打开'); } });
++$("#command-form").addEventListener("submit", (e) => {
++  e.preventDefault();
++  const command = $("#command").value.trim();
++  if (!command) {
++    $("#command").focus();
++    toast("请输入飞行任务，或选择一条快捷指令");
++    return;
++  }
++  history.unshift({
++    command,
++    time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
++  });
++  $("#command-feedback").textContent =
++    `已记录「${command}」。当前为 UI 演示，指令尚未发送至无人机。`;
++  $("#command").value = "";
++});
++$("#fullscreen").addEventListener("click", async () => {
++  try {
++    if (document.fullscreenElement) await document.exitFullscreen();
++    else await viewport.requestFullscreen();
++  } catch {
++    toast("当前预览环境不支持全屏，请在独立浏览器中打开");
++  }
++});
+ const captures = [];
+-$('#capture').addEventListener('click', () => { if(remoteActive) {toast('远程画面截图需接入图像接口，当前无法保存真实截图');return;} captures.unshift({ scene:options.scene.find(item=>item.id===selected.scene)?.name || '未选择场景', weather:options.weather.find(item=>item.id===selected.weather)?.name || '天气未设置', time:new Date().toLocaleTimeString('zh-CN', {hour12:false}) }); toast('已将当前演示画面信息保存至媒体库（本次会话）'); });
+-const modal = $('#modal');
++$("#capture").addEventListener("click", () => {
++  if (remoteActive) {
++    toast("远程画面截图需接入图像接口，当前无法保存真实截图");
++    return;
++  }
++  captures.unshift({
++    scene:
++      options.scene.find((item) => item.id === selected.scene)?.name ||
++      "未选择场景",
++    weather:
++      options.weather.find((item) => item.id === selected.weather)?.name ||
++      "天气未设置",
++    time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
++  });
++  toast("已将当前演示画面信息保存至媒体库（本次会话）");
++});
++const modal = $("#modal");
+ function openModal(type) {
+-  const content = $('#modal-content');
+-  if (type === 'connect') {
+-    $('#modal-title').textContent='连接 AirSim 画面';
+-    content.innerHTML='<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接用于显示 AirSim 应用窗口；右侧天气按钮通过 RPC 独立控制天气。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>';
+-    $('#console-origin').textContent=location.origin;
+-    let saved=''; try {saved=localStorage.getItem('aerolyte-xpra-url') || '';} catch {}
+-    $('#endpoint').value=activeXpraUrl || saved || DEFAULT_XPRA_URL;
+-    $('#xpra-connect-form').addEventListener('submit',e=>{e.preventDefault();try {connectXpra($('#endpoint').value);modal.close();} catch(error) {toast(error.message);}});
++  const content = $("#modal-content");
++  if (type === "connect") {
++    $("#modal-title").textContent = "连接 AirSim 画面";
++    content.innerHTML =
++      '<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接用于显示 AirSim 应用窗口；右侧天气按钮通过 RPC 独立控制天气。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>';
++    $("#console-origin").textContent = location.origin;
++    let saved = "";
++    try {
++      saved = localStorage.getItem("aerolyte-xpra-url") || "";
++    } catch {}
++    $("#endpoint").value = activeXpraUrl || saved || DEFAULT_XPRA_URL;
++    $("#xpra-connect-form").addEventListener("submit", (e) => {
++      e.preventDefault();
++      try {
++        connectXpra($("#endpoint").value);
++        modal.close();
++      } catch (error) {
++        toast(error.message);
++      }
++    });
++  }
++  if (type === "missions") {
++    $("#modal-title").textContent = "任务记录";
++    content.replaceChildren();
++    if (!history.length)
++      content.innerHTML = `<div class="empty-state">${icon("route")}<p>还没有飞行指令</p><p>在控制台输入任务，指令记录将显示在这里。</p></div>`;
++    else
++      history.forEach((item) => {
++        const row = document.createElement("div");
++        row.className = "media-item";
++        row.textContent = `${item.time} · ${item.command} · 未执行（演示）`;
++        content.append(row);
++      });
++  }
++  if (type === "media") {
++    $("#modal-title").textContent = "媒体库";
++    content.replaceChildren();
++    if (!captures.length)
++      content.innerHTML = `<div class="empty-state">${icon("camera")}<p>你的探索，值得被记录</p><p>点击画面上方的相机按钮，保存演示画面信息。<br>真实截图与视频将在视频流接入后提供。</p></div>`;
++    else
++      captures.forEach((item) => {
++        const row = document.createElement("div");
++        row.className = "media-item";
++        row.textContent = `${item.time} · ${item.scene} · ${item.weather}（演示信息）`;
++        content.append(row);
++      });
+   }
+-  if (type === 'missions') { $('#modal-title').textContent = '任务记录'; content.replaceChildren(); if (!history.length) content.innerHTML = `<div class="empty-state">${icon('route')}<p>还没有飞行指令</p><p>在控制台输入任务，指令记录将显示在这里。</p></div>`; else history.forEach(item => { const row = document.createElement('div'); row.className = 'media-item'; row.textContent = `${item.time} · ${item.command} · 未执行（演示）`; content.append(row); }); }
+-  if (type === 'media') { $('#modal-title').textContent = '媒体库'; content.replaceChildren(); if (!captures.length) content.innerHTML = `<div class="empty-state">${icon('camera')}<p>你的探索，值得被记录</p><p>点击画面上方的相机按钮，保存演示画面信息。<br>真实截图与视频将在视频流接入后提供。</p></div>`; else captures.forEach(item => { const row = document.createElement('div'); row.className = 'media-item'; row.textContent = `${item.time} · ${item.scene} · ${item.weather}（演示信息）`; content.append(row); }); }
+   if (!modal.open) modal.showModal();
+ }
+-$('#connect').addEventListener('click', () => openModal('connect'));
+-document.querySelectorAll('[data-modal]').forEach(button => button.addEventListener('click', () => openModal(button.dataset.modal)));
+-$('#close-modal').addEventListener('click', () => modal.close());
+-modal.addEventListener('click', e => { if (e.target === modal) { const r = modal.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) modal.close(); } });
++$("#connect").addEventListener("click", () => openModal("connect"));
++document
++  .querySelectorAll("[data-modal]")
++  .forEach((button) =>
++    button.addEventListener("click", () => openModal(button.dataset.modal)),
++  );
++$("#close-modal").addEventListener("click", () => modal.close());
++modal.addEventListener("click", (e) => {
++  if (e.target === modal) {
++    const r = modal.getBoundingClientRect();
++    if (
++      e.clientX < r.left ||
++      e.clientX > r.right ||
++      e.clientY < r.top ||
++      e.clientY > r.bottom
++    )
++      modal.close();
++  }
++});
+ 
+-let initialXpraUrl=DEFAULT_XPRA_URL;
+-try {initialXpraUrl=localStorage.getItem('aerolyte-xpra-url') || DEFAULT_XPRA_URL;} catch {}
+-try {connectXpra(initialXpraUrl,false);} catch(error) {disconnectXpra();toast(error.message);}
++let initialXpraUrl = DEFAULT_XPRA_URL;
++try {
++  initialXpraUrl =
++    localStorage.getItem("aerolyte-xpra-url") || DEFAULT_XPRA_URL;
++} catch {}
++try {
++  connectXpra(initialXpraUrl, false);
++} catch (error) {
++  disconnectXpra();
++  toast(error.message);
++}
+ 
+ // The probe is read-only. First successful connection initializes clear weather once per page.
+ let rpcCheckPending = false;
+ async function checkAirSim() {
+   if (rpcCheckPending || document.hidden || weatherPending) return;
+   rpcCheckPending = true;
+-  const status = $('#airsim-status');
++  const status = $("#airsim-status");
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), 35000);
+   try {
+-    const response = await fetch('/api/airsim', {signal: controller.signal, cache: 'no-store'});
++    const response = await fetch("/api/airsim", {
++      signal: controller.signal,
++      cache: "no-store",
++    });
+     const result = await response.json();
+-    if (!response.ok || result.connected !== true) throw new Error(result.message || 'AirSim RPC 未连接');
+-    status.textContent = 'AirSim RPC 已连接 · 可切换天气';
+-    status.dataset.state = 'success';
++    if (!response.ok || result.connected !== true)
++      throw new Error(result.message || "AirSim RPC 未连接");
++    status.textContent = "AirSim RPC 已连接 · 可切换天气";
++    status.dataset.state = "success";
+     if (!weatherInitialized && !weatherPending) {
+-      await applyWeather(options.weather.find(item => item.id === 'clear'));
++      await applyWeather(options.weather.find((item) => item.id === "clear"));
+     }
+   } catch (error) {
+-    status.textContent = error.name === 'AbortError' ? 'AirSim RPC 检查超时' : 'AirSim RPC 未连接，请检查模拟器';
+-    status.dataset.state = 'error';
++    status.textContent =
++      error.name === "AbortError"
++        ? "AirSim RPC 检查超时"
++        : "AirSim RPC 未连接，请检查模拟器";
++    status.dataset.state = "error";
+   } finally {
+     clearTimeout(timer);
+     rpcCheckPending = false;
+   }
+ }
+-if (!SCENE_CONTROL) {checkAirSim(); setInterval(checkAirSim, 15000);}
+-document.addEventListener('visibilitychange', () => { if (!document.hidden) {if (SCENE_CONTROL) pollScenes(); else checkAirSim();} });
++if (!SCENE_CONTROL) {
++  checkAirSim();
++  setInterval(checkAirSim, 15000);
++}
++document.addEventListener("visibilitychange", () => {
++  if (!document.hidden) {
++    if (SCENE_CONTROL) pollScenes();
++    else checkAirSim();
++  }
++});
+diff --git a/static/scenes.js b/static/scenes.js
+index 5fb4216..dbd4dbc 100644
+--- a/static/scenes.js
++++ b/static/scenes.js
+@@ -7,27 +7,45 @@ async function pollScenes() {
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), 10000);
+   try {
+-    const response = await fetch('/api/status', {cache:'no-store',signal:controller.signal});
++    const response = await fetch("/api/status", {
++      cache: "no-store",
++      signal: controller.signal,
++    });
+     const state = await response.json();
+-    if (!response.ok || !['idle','stopping','starting','initializing','ready','error'].includes(state.phase))
+-      throw new Error('无法读取有效场景状态');
++    if (
++      !response.ok ||
++      ![
++        "idle",
++        "stopping",
++        "starting",
++        "initializing",
++        "ready",
++        "error",
++      ].includes(state.phase)
++    )
++      throw new Error("无法读取有效场景状态");
+     if (sceneRequestPending) return;
+-    if (sceneManagerId !== state.manager_id) {sceneManagerId=state.manager_id;sceneRevision=-1;}
+-    if (typeof state.revision === 'number' && state.revision < sceneRevision) return;
++    if (sceneManagerId !== state.manager_id) {
++      sceneManagerId = state.manager_id;
++      sceneRevision = -1;
++    }
++    if (typeof state.revision === "number" && state.revision < sceneRevision)
++      return;
+     sceneRevision = state.revision ?? sceneRevision;
+     scenePhase = state.phase;
+-    sceneBusy = ['stopping','starting','initializing'].includes(state.phase);
++    sceneBusy = ["stopping", "starting", "initializing"].includes(state.phase);
+     selected.scene = state.scene;
+     sceneInstance = state.instance_id;
+     const text = state.error || state.stage;
+-    $('#scene-status').textContent = text;
+-    $('#scene-status').dataset.state = state.phase === 'error' ? 'error' : sceneBusy ? 'pending' : 'success';
+-    $('#scene-overlay').hidden = state.phase === 'ready';
+-    $('#scene-overlay-text').textContent = text;
+-    $('#cleanup-scene').disabled = sceneBusy;
+-    if (state.phase === 'ready') {
+-      $('#airsim-status').textContent = 'AirSim RPC 已连接 · 场景已就绪';
+-      $('#airsim-status').dataset.state = 'success';
++    $("#scene-status").textContent = text;
++    $("#scene-status").dataset.state =
++      state.phase === "error" ? "error" : sceneBusy ? "pending" : "success";
++    $("#scene-overlay").hidden = state.phase === "ready";
++    $("#scene-overlay-text").textContent = text;
++    $("#cleanup-scene").disabled = sceneBusy;
++    if (state.phase === "ready") {
++      $("#airsim-status").textContent = "AirSim RPC 已连接 · 场景已就绪";
++      $("#airsim-status").dataset.state = "success";
+       if (lastReadyInstance !== state.instance_id) {
+         const firstConnection = lastReadyInstance === null;
+         lastReadyInstance = state.instance_id;
+@@ -37,34 +55,41 @@ async function pollScenes() {
+       }
+       if (!weatherPending) {
+         selected.weather = state.weather;
+-        const applied = options.weather.find(item => item.id === state.weather);
+-        $('#weather-status').textContent = applied ? '已应用：' + applied.name : '天气状态未确认，请重试';
+-        $('#weather-status').dataset.state = applied ? 'success' : 'error';
++        const applied = options.weather.find(
++          (item) => item.id === state.weather,
++        );
++        $("#weather-status").textContent = applied
++          ? "已应用：" + applied.name
++          : "天气状态未确认，请重试";
++        $("#weather-status").dataset.state = applied ? "success" : "error";
+       }
+     } else {
+       selected.weather = null;
+-      $('#airsim-status').textContent = sceneBusy ? '场景切换中，暂停天气操作' : '场景未就绪';
+-      $('#airsim-status').dataset.state = sceneBusy ? 'pending' : 'error';
+-      $('#weather-status').textContent = '新场景就绪后将初始化晴朗';
++      $("#airsim-status").textContent = sceneBusy
++        ? "场景切换中，暂停天气操作"
++        : "场景未就绪";
++      $("#airsim-status").dataset.state = sceneBusy ? "pending" : "error";
++      $("#weather-status").textContent = "新场景就绪后将初始化晴朗";
+     }
+-    renderList('scene');
+-    if (!weatherPending) renderList('weather');
+-    if (state.phase === 'ready' && !weatherInitialized && !weatherPending)
+-      await applyWeather(options.weather.find(item => item.id === 'clear'));
++    renderList("scene");
++    if (!weatherPending) renderList("weather");
++    if (state.phase === "ready" && !weatherInitialized && !weatherPending)
++      await applyWeather(options.weather.find((item) => item.id === "clear"));
+   } catch (error) {
+-    $('#scene-status').textContent = '场景状态连接失败，请检查网页服务';
+-    $('#scene-status').dataset.state = 'error';
+-    scenePhase = 'error';
++    $("#scene-status").textContent = "场景状态连接失败，请检查网页服务";
++    $("#scene-status").dataset.state = "error";
++    scenePhase = "error";
+     sceneBusy = false;
+     sceneInstance = null;
+-    $('#scene-overlay').hidden = false;
+-    $('#scene-overlay-text').textContent = '状态连接失败，暂时停止画面输入';
+-    $('#cleanup-scene').disabled = false;
+-    renderList('scene'); renderList('weather');
++    $("#scene-overlay").hidden = false;
++    $("#scene-overlay-text").textContent = "状态连接失败，暂时停止画面输入";
++    $("#cleanup-scene").disabled = false;
++    renderList("scene");
++    renderList("weather");
+   } finally {
+     clearTimeout(timer);
+     scenePollPending = false;
+-    scenePollTimer=setTimeout(pollScenes, sceneBusy ? 1000 : 5000);
++    scenePollTimer = setTimeout(pollScenes, sceneBusy ? 1000 : 5000);
+   }
+ }
+ 
+@@ -72,37 +97,63 @@ async function sceneRequest(path, body) {
+   if (sceneBusy || sceneRequestPending) return;
+   sceneRequestPending = true;
+   sceneBusy = true;
+-  scenePhase = 'stopping';
+-  selected.scene = null; selected.weather = null; sceneInstance = null;
+-  $('#scene-overlay').hidden = false;
+-  $('#scene-overlay-text').textContent = '正在提交操作…';
+-  $('#cleanup-scene').disabled = true;
+-  renderList('scene'); renderList('weather');
++  scenePhase = "stopping";
++  selected.scene = null;
++  selected.weather = null;
++  sceneInstance = null;
++  $("#scene-overlay").hidden = false;
++  $("#scene-overlay-text").textContent = "正在提交操作…";
++  $("#cleanup-scene").disabled = true;
++  renderList("scene");
++  renderList("weather");
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), 10000);
+   try {
+-    const response = await fetch(path, {method:'POST',headers:{'Content-Type':'application/json'},
+-      body:JSON.stringify(body),signal:controller.signal});
++    const response = await fetch(path, {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify(body),
++      signal: controller.signal,
++    });
+     const state = await response.json();
+-    if (!response.ok) throw new Error(state.message || '场景操作失败');
+-    sceneManagerId=state.manager_id;
+-    sceneRevision=Math.max(sceneRevision,state.revision ?? -1);
++    if (!response.ok) throw new Error(state.message || "场景操作失败");
++    sceneManagerId = state.manager_id;
++    sceneRevision = Math.max(sceneRevision, state.revision ?? -1);
+   } catch (error) {
+-    toast(error.name === 'AbortError' ? '提交超时，正在查询服务端实际状态' : error.message);
++    toast(
++      error.name === "AbortError"
++        ? "提交超时，正在查询服务端实际状态"
++        : error.message,
++    );
+   } finally {
+     clearTimeout(timer);
+     sceneRequestPending = false;
+     await pollScenes();
+   }
+ }
+-function switchScene(id) { return sceneRequest('/api/switch', {scene_id:id}); }
++function switchScene(id) {
++  return sceneRequest("/api/switch", { scene_id: id });
++}
+ if (SCENE_CONTROL) {
+-  $('#cleanup-scene').addEventListener('click', () => sceneRequest('/api/cleanup', {}));
+-  $('#scene-overlay').hidden = false;
+-  fetch('/api/scenes', {cache:'no-store'})
+-    .then(response => {if (!response.ok) throw new Error('场景列表读取失败'); return response.json();})
+-    .then(result => {options.scene = result.scenes.map(item => ({...item,detail:item.name}));renderList('scene');})
+-    .catch(error => toast(error.message));
++  $("#cleanup-scene").addEventListener("click", () =>
++    sceneRequest("/api/cleanup", {}),
++  );
++  $("#scene-overlay").hidden = false;
++  fetch("/api/scenes", { cache: "no-store" })
++    .then((response) => {
++      if (!response.ok) throw new Error("场景列表读取失败");
++      return response.json();
++    })
++    .then((result) => {
++      options.scene = result.scenes.map((item) => ({
++        ...item,
++        detail: item.name,
++      }));
++      renderList("scene");
++    })
++    .catch((error) => toast(error.message));
+   pollScenes();
++} else {
++  $("#scene-status").textContent = "当前网页服务未启用场景管理";
++  $("#cleanup-scene").disabled = true;
+ }
+-else { $('#scene-status').textContent='当前网页服务未启用场景管理'; $('#cleanup-scene').disabled=true; }
+diff --git a/templates/index.html b/templates/index.html
+index ce27195..0fc7a81 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -8,7 +8,7 @@
+   <title>AirSim 飞行控制台</title>
+   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+ </head>
+-<body data-xpra-url="{{ xpra_url }}" data-scene-control="{{ 'true' if scene_control else 'false' }}">
++<body data-xpra-url="{{ xpra_url }}" data-scene-control="true">
+   <aside class="rail">
+     <button class="rail-button active" data-icon="dashboard" aria-label="飞行控制台" title="飞行控制台"></button>
+     <button class="rail-button" data-icon="route" data-modal="missions" aria-label="任务记录" title="任务记录"></button>
+diff --git a/tests/test_app.py b/tests/test_app.py
+index cdbdd19..516b73f 100644
+--- a/tests/test_app.py
++++ b/tests/test_app.py
+@@ -1,32 +1,43 @@
+ import unittest
+ 
+ from app import create_app
++from config import Settings
+ 
+ 
+ class FlaskConsoleTests(unittest.TestCase):
+     def setUp(self):
+-        self.app = create_app({"TESTING": True, "XPRA_URL": "http://example.test:10000/"})
++        self.app = create_app(Settings(ip="192.0.2.10", http_port=5173, xpra_port=10000))
+         self.client = self.app.test_client()
+ 
+     def test_page_renders_assets_and_configuration(self):
+         response = self.client.get("/")
+         self.assertEqual(response.status_code, 200)
+         html = response.get_data(as_text=True)
+-        self.assertIn('/static/styles.css', html)
+-        self.assertIn('/static/app.js', html)
+-        self.assertIn('data-xpra-url="http://example.test:10000/"', html)
+-        self.assertNotIn('{{', html)
++        self.assertIn("/static/styles.css", html)
++        self.assertIn("/static/app.js", html)
++        self.assertIn('data-xpra-url="http://192.0.2.10:10000/"', html)
++        self.assertNotIn("{{", html)
+ 
+     def test_compact_console_preserves_controls_without_promotional_header(self):
+-        html = self.client.get('/').get_data(as_text=True)
+-        for text in ['飞行，无限可能', '工作空间 01', '模拟环境', 'YOUR SKY. YOUR COMMAND.', '让探索，从此刻起飞', '连接你的无人机，用自然语言开启下一次飞行。']:
++        html = self.client.get("/").get_data(as_text=True)
++        for text in [
++            "飞行，无限可能",
++            "工作空间 01",
++            "模拟环境",
++            "YOUR SKY. YOUR COMMAND.",
++            "让探索，从此刻起飞",
++            "连接你的无人机，用自然语言开启下一次飞行。",
++        ]:
+             self.assertNotIn(text, html)
+         self.assertIn('id="connect"', html)
+         self.assertIn('id="focus-feed"', html)
+         self.assertIn('id="xpra-frame" tabindex="0"', html)
+ 
+     def test_static_resources(self):
+-        for path, mime in [("/static/app.js", "javascript"), ("/static/styles.css", "text/css")]:
++        for path, mime in [
++            ("/static/app.js", "javascript"),
++            ("/static/styles.css", "text/css"),
++        ]:
+             with self.subTest(path=path):
+                 response = self.client.get(path)
+                 self.assertEqual(response.status_code, 200)
+@@ -34,22 +45,42 @@ class FlaskConsoleTests(unittest.TestCase):
+                 response.close()
+ 
+     def test_health_and_configuration(self):
+-        self.assertEqual(self.client.get('/api/health').json, {"status": "ok", "backend": "flask"})
+-        configuration = self.client.get('/api/config').json
+-        self.assertEqual(configuration['xpra_url'], 'http://example.test:10000/')
+-        self.assertFalse(configuration['flight_control_available'])
++        self.assertEqual(
++            self.client.get("/api/health").json, {"status": "ok", "backend": "flask"}
++        )
++        configuration = self.client.get("/api/config").json
++        self.assertEqual(configuration["xpra_url"], "http://192.0.2.10:10000/")
++        self.assertEqual(configuration["console_url"], "http://192.0.2.10:5173/")
++        self.assertFalse(configuration["flight_control_available"])
+ 
+     def test_source_files_are_not_exposed(self):
+-        for path in ['/app.py', '/requirements.txt', '/.env', '/static/../app.py', '/missing']:
++        for path in [
++            "/app.py",
++            "/requirements.txt",
++            "/.env",
++            "/static/../app.py",
++            "/missing",
++        ]:
+             with self.subTest(path=path):
+                 self.assertEqual(self.client.get(path).status_code, 404)
+-        self.assertEqual(self.client.post('/api/config', json={}).status_code, 405)
++        self.assertEqual(self.client.post("/api/config", json={}).status_code, 405)
+ 
+-    def test_invalid_or_credentialed_configuration_is_rejected(self):
+-        for url in ['ws://example.test/', 'javascript:alert(1)', 'http://user:pass@example.test/', 'http://example.test/?token=secret']:
+-            with self.subTest(url=url), self.assertRaises(ValueError):
+-                create_app({"XPRA_URL": url})
++    def test_invalid_settings_are_rejected(self):
++        for kwargs in (
++            {"ip": "0.0.0.0"},
++            {"ip": "example.test"},
++            {"ip": "::"},
++            {"xpra_port": 5173},
++            {"rpc_port": 5173},
++            {"display": ":100; kill"},
++            {"poll_interval": float("nan")},
++            {"http_port": 70000},
++        ):
++            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
++                Settings(**kwargs)
++        with self.assertRaises(ValueError):
++            Settings(airsim_settings="/nonexistent/settings.json", rpc_port=0)
+ 
+ 
+-if __name__ == '__main__':
++if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_environment.py b/tests/test_environment.py
+index 905ae02..f6d811d 100644
+--- a/tests/test_environment.py
++++ b/tests/test_environment.py
+@@ -8,12 +8,14 @@ import unittest
+ from unittest.mock import MagicMock, patch
+ 
+ from app import create_app
+-from environment_service import EnvironmentService, SceneBusy, SceneConfig
++from config import Settings, airsim_rpc_port
++from environment_service import EnvironmentService, SceneBusy
+ from scene_launcher import SCENES, get_commands
+ from scene_processes import ProcessRuntime, SceneError
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ 
++
+ class SceneTests(unittest.TestCase):
+     def setUp(self):
+         (ROOT / ".runtime").mkdir(exist_ok=True)
+@@ -22,18 +24,23 @@ class SceneTests(unittest.TestCase):
+         self.root = Path(self.temp.name)
+         settings = self.root / "source.json"
+         settings.write_text('{"SimMode":"Multirotor"}')
+-        self.config = SceneConfig(settings=str(settings), port_release_wait=.05,
+-                                  kill_wait=.05, rpc_ready_timeout=.1, tcp_ready_timeout=.1,
+-                                  poll_interval=.01)
++        self.config = Settings(
++            airsim_settings=str(settings),
++            root=self.root,
++            port_release_wait=0.05,
++            kill_wait=0.05,
++            rpc_ready_timeout=0.1,
++            xpra_ready_timeout=0.1,
++            poll_interval=0.01,
++        )
+         self.weather = MagicMock()
+-        self.service = EnvironmentService(self.root, self.config, self.weather)
++        self.service = EnvironmentService(self.config, self.weather)
+         self.runtime = MagicMock()
+         self.runtime.path = self.root
+         (self.root / "logs").mkdir()
+-        self.runtime.sandbox.side_effect = lambda args: args
+         self.runtime.stop.return_value = []
+         self.runtime.window_ready.return_value = True
+-        self.runtime.holders.return_value = {100:("airsimnh", None)}
++        self.runtime.holders.return_value = {100: ("airsimnh", None)}
+         self.service.startup_weather = self.weather
+         self.service.runtime = self.runtime
+         self.service.lease = object()  # No production lock or launch in unit tests.
+@@ -44,10 +51,15 @@ class SceneTests(unittest.TestCase):
+         process.wait.return_value = 0
+         if error:
+             self.weather.apply.side_effect = error
+-        with patch("environment_service.port_alive", return_value=True), \
+-             patch("environment_service.subprocess.Popen", return_value=process), \
+-             patch("environment_service.identity", return_value=(1,os.getuid(),"fake",[])), \
+-             patch("environment_service.kill_verified_tree") as kill:
++        with (
++            patch("environment_service.port_alive", return_value=True),
++            patch("environment_service.subprocess.Popen", return_value=process),
++            patch(
++                "environment_service.identity",
++                return_value=(1, os.getuid(), "fake", []),
++            ),
++            patch("environment_service.kill_verified_tree") as kill,
++        ):
+             state, accepted = self.service.submit("airsimnh")
+             self.service.worker.join(2)
+             self.assertFalse(self.service.worker.is_alive())
+@@ -93,8 +105,10 @@ class SceneTests(unittest.TestCase):
+         self.runtime.stop.assert_not_called()
+ 
+     def test_weather_rejects_old_instance_busy_and_not_ready(self):
+-        self.service.state.update(phase="ready", scene="airsimnh", instance_id="current")
+-        with patch("environment_service.port_alive",return_value=True):
++        self.service.state.update(
++            phase="ready", scene="airsimnh", instance_id="current"
++        )
++        with patch("environment_service.port_alive", return_value=True):
+             with self.assertRaises(SceneBusy):
+                 self.service.apply_weather("rain", "old")
+             self.service.apply_weather("rain", "current")
+@@ -104,89 +118,153 @@ class SceneTests(unittest.TestCase):
+             self.service.apply_weather("clear", "current")
+ 
+     def test_missing_rpc_invalidates_ready_status(self):
+-        self.service.state.update(phase="ready",scene="airsimnh",instance_id="current")
+-        with patch("environment_service.port_alive",side_effect=[True,False]):
++        self.service.state.update(
++            phase="ready", scene="airsimnh", instance_id="current"
++        )
++        with patch("environment_service.port_alive", side_effect=[True, False]):
+             state = self.service.snapshot()
+-        self.assertEqual(state["phase"],"error")
++        self.assertEqual(state["phase"], "error")
+         self.assertIsNone(state["scene"])
+ 
++    def test_airsim_rpc_port_comes_from_settings(self):
++        settings = self.root / "port.json"
++        self.assertEqual(airsim_rpc_port(settings), 41451)  # 文件缺失
++        settings.write_text('{"SimMode":"Multirotor"}')
++        self.assertEqual(airsim_rpc_port(settings), 41451)  # 未配置
++        settings.write_text('{"ApiServerPort":4242}')
++        self.assertEqual(airsim_rpc_port(settings), 4242)
++        for bad in ('{"ApiServerPort":0}', '{"ApiServerPort":"4242"}', "[]"):
++            settings.write_text(bad)
++            with self.assertRaises(ValueError):
++                airsim_rpc_port(settings)
++
+     def test_config_rejects_unsafe_values(self):
+-        for kwargs in ({"display":":100; kill"}, {"tcp_port":41451},
+-                       {"rpc_port":0}, {"poll_interval":float("nan")}):
++        for kwargs in (
++            {"display": ":100; kill"},
++            {"xpra_port": 41451},
++            {"rpc_port": 0},
++            {"poll_interval": float("nan")},
++        ):
+             with self.assertRaises(ValueError):
+-                SceneConfig(**kwargs)
++                Settings(**kwargs)
+ 
+     def test_templates_do_not_run_chmod_scripts_or_browser_shell(self):
+         for key, scene in SCENES.items():
+             start, stop = get_commands(key, self.config, self.root)
+-            self.assertIn("--daemon=no",start)
+-            self.assertEqual(stop[2],"socket://"+str(self.root/"sessions"/"100"/"socket"))
++            self.assertIn("--daemon=no", start)
++            self.assertEqual(
++                stop[2], "socket://" + str(self.root / "sessions" / "100" / "socket")
++            )
+             child = next(arg for arg in start if arg.startswith("--start-child="))
+-            self.assertIn(scene.executable,child)
+-            self.assertNotIn(".sh",child)
+-            self.assertIn("-settings=",child)
++            self.assertIn(scene.executable, child)
++            self.assertNotIn(".sh", child)
++            self.assertIn("-settings=", child)
+ 
+     def test_unknown_listener_is_not_killed(self):
+-        runtime = ProcessRuntime(self.root,self.config)
+-        with patch("scene_processes.listener_pids",return_value={111}), \
+-             patch.object(runtime,"owned_scene",return_value=None), \
+-             patch("scene_processes.identity",return_value=(1,os.getuid(),"/unknown",["unknown"])), \
+-             patch("scene_processes.kill_verified_tree") as kill:
++        runtime = ProcessRuntime(self.config)
++        with (
++            patch("scene_processes.listener_pids", return_value={111}),
++            patch.object(runtime, "owned_scene", return_value=None),
++            patch(
++                "scene_processes.identity",
++                return_value=(1, os.getuid(), "/unknown", ["unknown"]),
++            ),
++            patch("scene_processes.kill_verified_tree") as kill,
++        ):
+             with self.assertRaises(SceneError):
+-                runtime.stop(["xpra","stop",":100"])
++                runtime.stop(["xpra", "stop", ":100"])
+             kill.assert_not_called()
+ 
+     def test_xpra_setproctitle_is_recognized_only_with_exact_runtime(self):
+-        runtime = ProcessRuntime(self.root,self.config)
++        runtime = ProcessRuntime(self.config)
+         exe = SCENES["airsimnh"].executable
+         title = f"/usr/bin/xpra start :100 --start-child={exe} AirSimNH --socket-dir={runtime.path / 'sockets'}"
+-        with patch("scene_processes.identity",return_value=(1,os.getuid(),os.path.realpath("/usr/bin/python3"),[title])):
+-            self.assertEqual(runtime.owned_scene(111),"airsimnh")
+-        with patch("scene_processes.identity",return_value=(1,os.getuid(),os.path.realpath("/usr/bin/python3"),[title.replace(":100",":1000")])):
++        with patch(
++            "scene_processes.identity",
++            return_value=(
++                1,
++                os.getuid(),
++                os.path.realpath("/usr/bin/python3"),
++                [title],
++            ),
++        ):
++            self.assertEqual(runtime.owned_scene(111), "airsimnh")
++        with patch(
++            "scene_processes.identity",
++            return_value=(
++                1,
++                os.getuid(),
++                os.path.realpath("/usr/bin/python3"),
++                [title.replace(":100", ":1000")],
++            ),
++        ):
+             self.assertIsNone(runtime.owned_scene(111))
+ 
+     def test_window_mapping_is_limited_to_verified_scene_pid(self):
+-        runtime = ProcessRuntime(self.root,self.config)
+-        info = MagicMock(stdout="windows.200.pid=500\n",returncode=0)
+-        with patch("scene_processes.subprocess.run",return_value=info) as run, \
+-             patch.object(runtime,"owned_scene",return_value="airsimnh"):
++        runtime = ProcessRuntime(self.config)
++        info = MagicMock(stdout="windows.200.pid=500\n", returncode=0)
++        with (
++            patch("scene_processes.subprocess.run", return_value=info) as run,
++            patch.object(runtime, "owned_scene", return_value="airsimnh"),
++        ):
+             self.assertTrue(runtime.window_ready("airsimnh"))
+-            self.assertEqual(len(run.call_args_list),3)
+-            self.assertIn("map",run.call_args_list[1].args[0])
+-            self.assertIn("focus",run.call_args_list[2].args[0])
+-        with patch("scene_processes.subprocess.run",return_value=info) as run, \
+-             patch.object(runtime,"owned_scene",return_value=None):
++            self.assertEqual(len(run.call_args_list), 3)
++            self.assertIn("map", run.call_args_list[1].args[0])
++            self.assertIn("focus", run.call_args_list[2].args[0])
++        with (
++            patch("scene_processes.subprocess.run", return_value=info) as run,
++            patch.object(runtime, "owned_scene", return_value=None),
++        ):
+             self.assertFalse(runtime.window_ready("airsimnh"))
+-            self.assertEqual(run.call_count,1)
++            self.assertEqual(run.call_count, 1)
++
+ 
+ class SceneApiTests(unittest.TestCase):
+     def setUp(self):
+-        self.app = create_app({"TESTING":True,"SCENE_CONTROL_ENABLED":True})
++        (ROOT / ".runtime").mkdir(exist_ok=True)
++        temp = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")
++        self.addCleanup(temp.cleanup)
++        settings = Path(temp.name) / "settings.json"
++        settings.write_text('{"SimMode":"Multirotor","ApiServerPort":41451}')
++        self.app = create_app(Settings(airsim_settings=str(settings)))
+         self.client = self.app.test_client()
+-        self.manager = self.app.extensions["environment_service"]
++        self.manager = self.app.extensions["services"].scenes
+ 
+     def test_fixed_scene_catalog_and_no_add_controls(self):
+         response = self.client.get("/api/scenes")
+-        self.assertEqual([s["id"] for s in response.json["scenes"]],list(SCENES))
++        self.assertEqual([s["id"] for s in response.json["scenes"]], list(SCENES))
+         html = self.client.get("/").get_data(as_text=True)
+-        self.assertIn('data-scene-control="true"',html)
+-        self.assertNotIn('data-add="scene"',html)
+-        self.assertIn('id="scene-overlay"',html)
++        self.assertIn('data-scene-control="true"', html)
++        self.assertNotIn('data-add="scene"', html)
++        self.assertIn('id="scene-overlay"', html)
+ 
+     def test_routes_reject_invalid_busy_and_cross_origin(self):
+-        self.assertEqual(self.client.post("/api/switch",json={"scene_id":"bad"}).status_code,400)
+-        with patch.object(self.manager,"submit",side_effect=SceneBusy("busy")):
+-            self.assertEqual(self.client.post("/api/switch",json={"scene_id":"airsimnh"}).status_code,409)
+-        for path in ("/api/switch","/api/cleanup","/api/weather"):
+-            response=self.client.post(path,json={},headers={"Origin":"http://evil.test"})
+-            self.assertEqual(response.status_code,403)
+-        self.assertEqual(self.client.get("/api/cleanup").status_code,405)
++        self.assertEqual(
++            self.client.post("/api/switch", json={"scene_id": "bad"}).status_code, 400
++        )
++        with patch.object(self.manager, "submit", side_effect=SceneBusy("busy")):
++            self.assertEqual(
++                self.client.post(
++                    "/api/switch", json={"scene_id": "airsimnh"}
++                ).status_code,
++                409,
++            )
++        for path in ("/api/switch", "/api/cleanup", "/api/weather"):
++            response = self.client.post(
++                path, json={}, headers={"Origin": "http://evil.test"}
++            )
++            self.assertEqual(response.status_code, 403)
++        self.assertEqual(self.client.get("/api/cleanup").status_code, 405)
+ 
+     def test_weather_closed_before_ready_and_uses_instance(self):
+-        response=self.client.post("/api/weather",json={"weather":"rain","instance_id":"stale"})
+-        self.assertEqual(response.status_code,409)
+-        self.assertEqual(self.client.get("/api/airsim").status_code,503)
+-        with patch.object(self.manager,"apply_weather",return_value="live") as apply:
+-            result=self.client.post("/api/weather",json={"weather":"snow","instance_id":"live"})
+-            apply.assert_called_once_with("snow","live")
+-            self.assertEqual(result.json["instance_id"],"live")
++        response = self.client.post(
++            "/api/weather", json={"weather": "rain", "instance_id": "stale"}
++        )
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(self.client.get("/api/airsim").status_code, 503)
++        with patch.object(self.manager, "apply_weather", return_value="live") as apply:
++            result = self.client.post(
++                "/api/weather", json={"weather": "snow", "instance_id": "live"}
++            )
++            apply.assert_called_once_with("snow", "live")
++            self.assertEqual(result.json["instance_id"], "live")
+diff --git a/tests/test_frontend.cjs b/tests/test_frontend.cjs
+index 3832641..c9a5742 100644
+--- a/tests/test_frontend.cjs
++++ b/tests/test_frontend.cjs
+@@ -1,118 +1,249 @@
+-const {test} = require('node:test');
+-const assert = require('node:assert/strict');
+-const {readFileSync} = require('node:fs');
+-const vm = require('node:vm');
+-const scenesSource=readFileSync(require('node:path').join(__dirname,'../static/scenes.js'),'utf8');
+-const source = readFileSync(require('node:path').join(__dirname, '../static/app.js'), 'utf8');
++const { test } = require("node:test");
++const assert = require("node:assert/strict");
++const { readFileSync } = require("node:fs");
++const vm = require("node:vm");
++const scenesSource = readFileSync(
++  require("node:path").join(__dirname, "../static/scenes.js"),
++  "utf8",
++);
++const source = readFileSync(
++  require("node:path").join(__dirname, "../static/app.js"),
++  "utf8",
++);
+ 
+-function consolePage({connected = true, weatherOk = true, sceneControl=false} = {}) {
++function consolePage({
++  connected = true,
++  weatherOk = true,
++  sceneControl = false,
++} = {}) {
+   const elements = new Map();
+   function element() {
+-    return {contains(){return false;}, focus(){context.document.activeElement=this; state.focuses++;},
+-      contentWindow:{focus(){state.windowFocuses++;}}, dataset:{}, classList:{add(){},remove(){}}, scrollTop:0,
+-      setAttribute(){},removeAttribute(){},addEventListener(){},append(){},replaceChildren(){}};
++    return {
++      contains() {
++        return false;
++      },
++      focus() {
++        context.document.activeElement = this;
++        state.focuses++;
++      },
++      contentWindow: {
++        focus() {
++          state.windowFocuses++;
++        },
++      },
++      dataset: {},
++      classList: { add() {}, remove() {} },
++      scrollTop: 0,
++      setAttribute() {},
++      removeAttribute() {},
++      addEventListener() {},
++      append() {},
++      replaceChildren() {},
++    };
+   }
+-  const state = {connected, weatherOk, requests:[], focuses:0, windowFocuses:0,
+-    sceneStatus:{phase:'ready',scene:'airsimnh',instance_id:'initial',operation_id:'op1',manager_id:'manager',revision:1,weather:'clear',stage:'场景已就绪'}};
++  const state = {
++    connected,
++    weatherOk,
++    requests: [],
++    focuses: 0,
++    windowFocuses: 0,
++    sceneStatus: {
++      phase: "ready",
++      scene: "airsimnh",
++      instance_id: "initial",
++      operation_id: "op1",
++      manager_id: "manager",
++      revision: 1,
++      weather: "clear",
++      stage: "场景已就绪",
++    },
++  };
+   const context = vm.createContext({
+-    document: {body:{dataset:{xpraUrl:'http://example.test:10000/',sceneControl:sceneControl?'true':'false'}}, hidden:false,
+-      querySelector(selector) { if (!elements.has(selector)) elements.set(selector, element()); return elements.get(selector); },
+-      querySelectorAll(){return [];},createElement:element,addEventListener(){}},
+-    location:{protocol:'http:',origin:'http://example.test:5173'},
+-    localStorage:{getItem(){return null;},setItem(){}},
+-    URL, AbortController, setTimeout(){return 1;},clearTimeout(){},setInterval(){},
+-    fetch:async (url, options = {}) => {
+-      const weather = options.body ? JSON.parse(options.body).weather : undefined;
+-      state.requests.push({url,weather,body:options.body?JSON.parse(options.body):null});
+-      if (url==='/api/scenes') return {ok:true,json:async()=>({scenes:[
+-        {id:'airsimnh',name:'AirSimNH',available:true},
+-        {id:'abandonedpark',name:'AbandonedPark',available:true},
+-        {id:'msbuild2018',name:'MSBuild2018',available:true}]})};
+-      if (url==='/api/status') {
+-        const snapshot={...state.sceneStatus};
++    document: {
++      body: {
++        dataset: {
++          xpraUrl: "http://example.test:10000/",
++          sceneControl: sceneControl ? "true" : "false",
++        },
++      },
++      hidden: false,
++      querySelector(selector) {
++        if (!elements.has(selector)) elements.set(selector, element());
++        return elements.get(selector);
++      },
++      querySelectorAll() {
++        return [];
++      },
++      createElement: element,
++      addEventListener() {},
++    },
++    location: { protocol: "http:", origin: "http://example.test:5173" },
++    localStorage: {
++      getItem() {
++        return null;
++      },
++      setItem() {},
++    },
++    URL,
++    AbortController,
++    setTimeout() {
++      return 1;
++    },
++    clearTimeout() {},
++    setInterval() {},
++    fetch: async (url, options = {}) => {
++      const weather = options.body
++        ? JSON.parse(options.body).weather
++        : undefined;
++      state.requests.push({
++        url,
++        weather,
++        body: options.body ? JSON.parse(options.body) : null,
++      });
++      if (url === "/api/scenes")
++        return {
++          ok: true,
++          json: async () => ({
++            scenes: [
++              { id: "airsimnh", name: "AirSimNH", available: true },
++              { id: "abandonedpark", name: "AbandonedPark", available: true },
++              { id: "msbuild2018", name: "MSBuild2018", available: true },
++            ],
++          }),
++        };
++      if (url === "/api/status") {
++        const snapshot = { ...state.sceneStatus };
+         if (state.statusWait) await state.statusWait;
+-        return {ok:true,json:async()=>snapshot};
++        return { ok: true, json: async () => snapshot };
+       }
+-      if (url==='/api/switch' || url==='/api/cleanup') {
+-        state.sceneStatus={...state.sceneStatus,phase:'starting',scene:null,revision:state.sceneStatus.revision+1,
+-          operation_id:'next-op',stage:'正在切换'};
+-        return {ok:true,json:async()=>({...state.sceneStatus})};
++      if (url === "/api/switch" || url === "/api/cleanup") {
++        state.sceneStatus = {
++          ...state.sceneStatus,
++          phase: "starting",
++          scene: null,
++          revision: state.sceneStatus.revision + 1,
++          operation_id: "next-op",
++          stage: "正在切换",
++        };
++        return { ok: true, json: async () => ({ ...state.sceneStatus }) };
+       }
+-      if (url === '/api/weather' && state.weatherWait) await state.weatherWait;
+-      const ok = url === '/api/airsim' ? state.connected : state.weatherOk;
+-      return {ok, json:async () => url === '/api/airsim' ? {connected:ok} : ok ? {status:'applied',weather,...(sceneControl?{instance_id:JSON.parse(options.body).instance_id}:{})} : {message:'RPC failed'}};
+-    }
++      if (url === "/api/weather" && state.weatherWait) await state.weatherWait;
++      const ok = url === "/api/airsim" ? state.connected : state.weatherOk;
++      return {
++        ok,
++        json: async () =>
++          url === "/api/airsim"
++            ? { connected: ok }
++            : ok
++              ? {
++                  status: "applied",
++                  weather,
++                  ...(sceneControl
++                    ? { instance_id: JSON.parse(options.body).instance_id }
++                    : {}),
++                }
++              : { message: "RPC failed" },
++      };
++    },
+   });
+   vm.runInContext(source, context);
+-  if(sceneControl) vm.runInContext(scenesSource,context);
+-  return {state, elements, run: code => vm.runInContext(code, context)};
++  if (sceneControl) vm.runInContext(scenesSource, context);
++  return { state, elements, run: (code) => vm.runInContext(code, context) };
+ }
+-const settle = () => new Promise(resolve => setImmediate(resolve));
++const settle = () => new Promise((resolve) => setImmediate(resolve));
+ 
+-test('first connection applies clear and selects it after RPC succeeds', async () => {
++test("first connection applies clear and selects it after RPC succeeds", async () => {
+   const page = consolePage();
+   await settle();
+-  assert.equal(page.run('selected.weather'), 'clear');
+-  assert.equal(page.elements.get('#weather-status').textContent, '已应用：晴朗');
+-  assert.equal(page.state.requests.filter(r => r.weather === 'clear').length, 1);
+-  await page.run('checkAirSim()');
+-  assert.equal(page.state.requests.filter(r => r.weather === 'clear').length, 1);
++  assert.equal(page.run("selected.weather"), "clear");
++  assert.equal(
++    page.elements.get("#weather-status").textContent,
++    "已应用：晴朗",
++  );
++  assert.equal(
++    page.state.requests.filter((r) => r.weather === "clear").length,
++    1,
++  );
++  await page.run("checkAirSim()");
++  assert.equal(
++    page.state.requests.filter((r) => r.weather === "clear").length,
++    1,
++  );
+ });
+ 
+-test('offline connection waits and initializes clear after recovery', async () => {
+-  const page = consolePage({connected:false});
++test("offline connection waits and initializes clear after recovery", async () => {
++  const page = consolePage({ connected: false });
+   await settle();
+-  assert.equal(page.run('selected.weather'), null);
+-  assert.equal(page.state.requests.filter(r => r.weather).length, 0);
++  assert.equal(page.run("selected.weather"), null);
++  assert.equal(page.state.requests.filter((r) => r.weather).length, 0);
+   page.state.connected = true;
+-  await page.run('checkAirSim()');
+-  assert.equal(page.run('selected.weather'), 'clear');
++  await page.run("checkAirSim()");
++  assert.equal(page.run("selected.weather"), "clear");
+ });
+ 
+-test('failed default is not marked applied and is retried after recovery', async () => {
+-  const page = consolePage({weatherOk:false});
++test("failed default is not marked applied and is retried after recovery", async () => {
++  const page = consolePage({ weatherOk: false });
+   await settle();
+-  assert.equal(page.run('selected.weather'), null);
+-  assert.equal(page.elements.get('#weather-status').dataset.state, 'error');
++  assert.equal(page.run("selected.weather"), null);
++  assert.equal(page.elements.get("#weather-status").dataset.state, "error");
+   page.state.weatherOk = true;
+-  await page.run('checkAirSim()');
+-  assert.equal(page.run('selected.weather'), 'clear');
++  await page.run("checkAirSim()");
++  assert.equal(page.run("selected.weather"), "clear");
+ });
+ 
+-test('periodic health checks preserve manually selected rain', async () => {
++test("periodic health checks preserve manually selected rain", async () => {
+   const page = consolePage();
+   await settle();
+-  await page.run("applyWeather(options.weather.find(item => item.id === 'rain'))");
++  await page.run(
++    "applyWeather(options.weather.find(item => item.id === 'rain'))",
++  );
+   page.state.connected = false;
+-  await page.run('checkAirSim()');
++  await page.run("checkAirSim()");
+   page.state.connected = true;
+-  await page.run('checkAirSim()');
+-  assert.equal(page.run('selected.weather'), 'rain');
+-  assert.equal(page.state.requests.filter(r => r.weather === 'clear').length, 1);
++  await page.run("checkAirSim()");
++  assert.equal(page.run("selected.weather"), "rain");
++  assert.equal(
++    page.state.requests.filter((r) => r.weather === "clear").length,
++    1,
++  );
+ });
+ 
+ for (const weatherOk of [true, false]) {
+   test(`weather switch returns input to the AirSim iframe (RPC success=${weatherOk})`, async () => {
+     const page = consolePage();
+     await settle();
+-    assert.equal(page.state.focuses, 0, 'automatic initialization must not steal focus');
+-    const source = page.elements.get('#xpra-frame').src;
++    assert.equal(
++      page.state.focuses,
++      0,
++      "automatic initialization must not steal focus",
++    );
++    const source = page.elements.get("#xpra-frame").src;
+     page.state.weatherOk = weatherOk;
+-    page.run('document.activeElement=document.body');
+-    await page.run("applyWeather(options.weather.find(item => item.id === 'rain'), true)");
++    page.run("document.activeElement=document.body");
++    await page.run(
++      "applyWeather(options.weather.find(item => item.id === 'rain'), true)",
++    );
+     assert.equal(page.state.focuses, 1);
+     assert.equal(page.state.windowFocuses, 1);
+     assert.equal(page.run("document.activeElement === $('#xpra-frame')"), true);
+-    assert.equal(page.elements.get('#xpra-frame').src, source, 'weather must not reconnect xpra');
++    assert.equal(
++      page.elements.get("#xpra-frame").src,
++      source,
++      "weather must not reconnect xpra",
++    );
+   });
+ }
+ 
+-test('a pending weather request does not steal focus from the command input', async () => {
++test("a pending weather request does not steal focus from the command input", async () => {
+   const page = consolePage();
+   await settle();
+   let release;
+-  page.state.weatherWait = new Promise(resolve => {release=resolve;});
+-  const switching = page.run("applyWeather(options.weather.find(item => item.id === 'rain'), true)");
++  page.state.weatherWait = new Promise((resolve) => {
++    release = resolve;
++  });
++  const switching = page.run(
++    "applyWeather(options.weather.find(item => item.id === 'rain'), true)",
++  );
+   page.run("document.activeElement=$('#command')");
+   release();
+   await switching;
+@@ -120,7 +251,7 @@ test('a pending weather request does not steal focus from the command input', as
+   assert.equal(page.run("document.activeElement === $('#command')"), true);
+ });
+ 
+-test('resume control returns keyboard focus without restarting the stream', async () => {
++test("resume control returns keyboard focus without restarting the stream", async () => {
+   const page = consolePage();
+   await settle();
+   page.run("document.activeElement=$('#command'); focusAirSim(true)");
+@@ -128,57 +259,78 @@ test('resume control returns keyboard focus without restarting the stream', asyn
+   assert.equal(page.state.windowFocuses, 1);
+ });
+ 
+-test('managed page initializes clear against the actual instance and renders fixed scenes', async () => {
+-  const page=consolePage({sceneControl:true});
++test("managed page initializes clear against the actual instance and renders fixed scenes", async () => {
++  const page = consolePage({ sceneControl: true });
+   await settle();
+-  assert.equal(page.run('selected.scene'),'airsimnh');
+-  assert.equal(page.run('selected.weather'),'clear');
+-  assert.equal(page.elements.get('#scene-overlay').hidden,true);
+-  const request=page.state.requests.find(r=>r.url==='/api/weather');
+-  assert.equal(request.body.instance_id,'initial');
+-  assert.equal(page.run('options.scene.map(s=>s.id).join()'),'airsimnh,abandonedpark,msbuild2018');
++  assert.equal(page.run("selected.scene"), "airsimnh");
++  assert.equal(page.run("selected.weather"), "clear");
++  assert.equal(page.elements.get("#scene-overlay").hidden, true);
++  const request = page.state.requests.find((r) => r.url === "/api/weather");
++  assert.equal(request.body.instance_id, "initial");
++  assert.equal(
++    page.run("options.scene.map(s=>s.id).join()"),
++    "airsimnh,abandonedpark,msbuild2018",
++  );
+ });
+ 
+-test('managed switching blocks weather and restores controls only after ready', async () => {
+-  const page=consolePage({sceneControl:true});
++test("managed switching blocks weather and restores controls only after ready", async () => {
++  const page = consolePage({ sceneControl: true });
+   await settle();
+   await page.run("switchScene('abandonedpark')");
+-  assert.equal(page.run('sceneBusy'),true);
+-  assert.equal(page.elements.get('#scene-overlay').hidden,false);
+-  const before=page.state.requests.filter(r=>r.url==='/api/weather').length;
++  assert.equal(page.run("sceneBusy"), true);
++  assert.equal(page.elements.get("#scene-overlay").hidden, false);
++  const before = page.state.requests.filter(
++    (r) => r.url === "/api/weather",
++  ).length;
+   await page.run("applyWeather(options.weather[1],true)");
+-  assert.equal(page.state.requests.filter(r=>r.url==='/api/weather').length,before);
+-  page.state.sceneStatus={...page.state.sceneStatus,phase:'ready',scene:'abandonedpark',
+-    instance_id:'new',weather:'clear',revision:3};
+-  await page.run('pollScenes()');
+-  assert.equal(page.run('selected.scene'),'abandonedpark');
+-  assert.equal(page.run('sceneInstance'),'new');
+-  assert.equal(page.elements.get('#scene-overlay').hidden,true);
+-  assert.equal(page.state.requests.filter(r=>r.url==='/api/weather').length,before);
++  assert.equal(
++    page.state.requests.filter((r) => r.url === "/api/weather").length,
++    before,
++  );
++  page.state.sceneStatus = {
++    ...page.state.sceneStatus,
++    phase: "ready",
++    scene: "abandonedpark",
++    instance_id: "new",
++    weather: "clear",
++    revision: 3,
++  };
++  await page.run("pollScenes()");
++  assert.equal(page.run("selected.scene"), "abandonedpark");
++  assert.equal(page.run("sceneInstance"), "new");
++  assert.equal(page.elements.get("#scene-overlay").hidden, true);
++  assert.equal(
++    page.state.requests.filter((r) => r.url === "/api/weather").length,
++    before,
++  );
+ });
+ 
+-test('managed page discards weather success from an old instance', async () => {
+-  const page=consolePage({sceneControl:true});
++test("managed page discards weather success from an old instance", async () => {
++  const page = consolePage({ sceneControl: true });
+   await settle();
+   let release;
+-  page.state.weatherWait=new Promise(resolve=>{release=resolve;});
+-  const applying=page.run("applyWeather(options.weather[1],true)");
++  page.state.weatherWait = new Promise((resolve) => {
++    release = resolve;
++  });
++  const applying = page.run("applyWeather(options.weather[1],true)");
+   page.run("sceneInstance='new';selected.weather=null;scenePhase='starting'");
+   release();
+   await applying;
+-  assert.equal(page.run('selected.weather'),null);
+-  assert.equal(page.state.focuses,0);
++  assert.equal(page.run("selected.weather"), null);
++  assert.equal(page.state.focuses, 0);
+ });
+ 
+-test('late status responses cannot undo an accepted scene operation', async () => {
+-  const page=consolePage({sceneControl:true});
++test("late status responses cannot undo an accepted scene operation", async () => {
++  const page = consolePage({ sceneControl: true });
+   await settle();
+   let release;
+-  page.state.statusWait=new Promise(resolve=>{release=resolve;});
+-  const stale=page.run('pollScenes()');
++  page.state.statusWait = new Promise((resolve) => {
++    release = resolve;
++  });
++  const stale = page.run("pollScenes()");
+   await page.run("switchScene('abandonedpark')");
+   release();
+   await stale;
+-  assert.equal(page.run('sceneBusy'),true);
+-  assert.equal(page.elements.get('#scene-overlay').hidden,false);
++  assert.equal(page.run("sceneBusy"), true);
++  assert.equal(page.elements.get("#scene-overlay").hidden, false);
+ });
+diff --git a/tests/test_weather.py b/tests/test_weather.py
+index 03caa9a..e99bfb2 100644
+--- a/tests/test_weather.py
++++ b/tests/test_weather.py
+@@ -1,10 +1,13 @@
+ import socket
++import tempfile
+ import unittest
+-from unittest.mock import patch
++from pathlib import Path
++from unittest.mock import MagicMock, patch
+ 
+ import msgpack
+ 
+ from app import create_app
++from config import Settings
+ from weather_service import PARAMETER_IDS, WEATHER_PRESETS
+ 
+ 
+@@ -41,76 +44,134 @@ class RpcConnection:
+ 
+ 
+ class WeatherTests(unittest.TestCase):
++    """天气接口只在场景就绪后可用；这里把管理器置于 ready 状态。"""
++
+     def setUp(self):
+-        self.app = create_app({"TESTING": True})
++        self.app = create_app(Settings())
+         self.client = self.app.test_client()
++        self.scenes = self.app.extensions["services"].scenes
++        self.instance = "instance-1"
++        runtime = MagicMock()
++        runtime.holders.return_value = {100: ("airsimnh", None)}
++        self.scenes.runtime = runtime
++        self.scenes.state.update(
++            phase="ready", scene="airsimnh", instance_id=self.instance
++        )
++        ports = patch("environment_service.port_alive", return_value=True)
++        ports.start()
++        self.addCleanup(ports.stop)
++
++    def request(self, weather):
++        return self.client.post(
++            "/api/weather", json={"weather": weather, "instance_id": self.instance}
++        )
+ 
+     def test_all_presets_send_every_parameter_including_resets(self):
+         for weather, parameters in WEATHER_PRESETS.items():
+             with self.subTest(weather=weather):
+                 connection = RpcConnection()
+-                with patch('weather_service.socket.create_connection', return_value=connection):
+-                    response = self.client.post('/api/weather', json={"weather": weather})
++                with patch(
++                    "weather_service.socket.create_connection", return_value=connection
++                ):
++                    response = self.request(weather)
+                 self.assertEqual(response.status_code, 200)
+-                self.assertEqual(response.json, {"weather": weather, "status": "applied"})
++                self.assertEqual(
++                    response.json,
++                    {
++                        "weather": weather,
++                        "status": "applied",
++                        "instance_id": self.instance,
++                    },
++                )
+                 methods = [(request[2], request[3]) for request in connection.requests]
+-                self.assertEqual(methods[:2], [('ping', []), ('simEnableWeather', [True])])
+-                self.assertEqual(methods[2:], [
+-                    ('simSetWeatherParameter', [PARAMETER_IDS[key], float(value)])
+-                    for key, value in parameters.items()
+-                ])
++                self.assertEqual(
++                    methods[:2], [("ping", []), ("simEnableWeather", [True])]
++                )
++                self.assertEqual(
++                    methods[2:],
++                    [
++                        ("simSetWeatherParameter", [PARAMETER_IDS[key], float(value)])
++                        for key, value in parameters.items()
++                    ],
++                )
+                 self.assertEqual(len(methods), 10)
+ 
+     def test_unknown_weather_or_malformed_body_never_calls_airsim(self):
+-        with patch('weather_service.socket.create_connection') as connect:
+-            for payload in [{"weather": "cloudy"}, {"weather": []}, {}, [], {"weather": "__dict__"}]:
+-                self.assertEqual(self.client.post('/api/weather', json=payload).status_code, 400)
+-            self.assertEqual(self.client.post('/api/weather', data='{', content_type='application/json').status_code, 400)
++        with patch("weather_service.socket.create_connection") as connect:
++            for payload in [
++                {"weather": "cloudy"},
++                {"weather": []},
++                {},
++                [],
++                {"weather": "__dict__"},
++            ]:
++                self.assertEqual(
++                    self.client.post("/api/weather", json=payload).status_code, 400
++                )
++            self.assertEqual(
++                self.client.post(
++                    "/api/weather", data="{", content_type="application/json"
++                ).status_code,
++                400,
++            )
+             connect.assert_not_called()
+ 
+     def test_rpc_failure_and_timeout_do_not_report_success(self):
+         for connection in [RpcConnection(error_at=5), RpcConnection(timeout=True)]:
+-            with self.subTest(connection=connection), patch('weather_service.socket.create_connection', return_value=connection):
+-                response = self.client.post('/api/weather', json={"weather": "rain"})
++            with (
++                self.subTest(connection=connection),
++                patch(
++                    "weather_service.socket.create_connection", return_value=connection
++                ),
++            ):
++                response = self.request("rain")
+             self.assertEqual(response.status_code, 503)
+-            self.assertEqual(response.json['error'], 'airsim_unavailable')
+-            self.assertNotIn('status', response.json)
+-        self.assertFalse(self.app.extensions['weather_service'].lock.locked())
++            self.assertEqual(response.json["error"], "airsim_unavailable")
++            self.assertNotIn("status", response.json)
++        self.assertFalse(self.app.extensions["services"].weather.lock.locked())
+ 
+     def test_busy_request_does_not_interleave_parameters(self):
+-        service = self.app.extensions['weather_service']
++        service = self.app.extensions["services"].weather
+         service.lock.acquire()
+         try:
+-            response = self.client.post('/api/weather', json={"weather": "snow"})
++            response = self.request("snow")
+         finally:
+             service.lock.release()
+         self.assertEqual(response.status_code, 409)
+ 
+     def test_status_probe_only_pings_and_never_changes_weather(self):
+         connection = RpcConnection()
+-        with patch('weather_service.socket.create_connection', return_value=connection):
+-            response = self.client.get('/api/airsim')
++        with patch("weather_service.socket.create_connection", return_value=connection):
++            response = self.client.get("/api/airsim")
+         self.assertEqual(response.status_code, 200)
+-        self.assertTrue(response.json['connected'])
+-        self.assertEqual([(r[2], r[3]) for r in connection.requests], [('ping', [])])
++        self.assertTrue(response.json["connected"])
++        self.assertEqual([(r[2], r[3]) for r in connection.requests], [("ping", [])])
+ 
+     def test_status_reports_rpc_failure(self):
+         for connection in [RpcConnection(timeout=True), RpcConnection(error_at=1)]:
+-            with self.subTest(connection=connection), patch('weather_service.socket.create_connection', return_value=connection):
+-                response = self.client.get('/api/airsim')
++            with (
++                self.subTest(connection=connection),
++                patch(
++                    "weather_service.socket.create_connection", return_value=connection
++                ),
++            ):
++                response = self.client.get("/api/airsim")
+             self.assertEqual(response.status_code, 503)
+-            self.assertFalse(response.json['connected'])
++            self.assertFalse(response.json["connected"])
+ 
+     def test_configuration_and_fixed_weather_ui(self):
+-        app = create_app({"TESTING": True, "AIRSIM_HOST": "example.test", "AIRSIM_PORT": 4242})
+-        service = app.extensions['weather_service']
+-        self.assertEqual((service.host, service.port), ('example.test', 4242))
+-        html = self.client.get('/').get_data(as_text=True)
++        with tempfile.TemporaryDirectory() as directory:
++            settings = Path(directory) / "settings.json"
++            settings.write_text('{"ApiServerPort": 4242}')
++            app = create_app(Settings(airsim_settings=str(settings)))
++            service = app.extensions["services"].weather
++            self.assertEqual((service.host, service.port), ("127.0.0.1", 4242))
++        html = self.client.get("/").get_data(as_text=True)
+         self.assertNotIn('data-add="weather"', html)
+         self.assertNotIn('data-remove="weather"', html)
+         self.assertNotIn('data-add="scene"', html)
+         self.assertIn('id="weather-status"', html)
+ 
+ 
+-if __name__ == '__main__':
++if __name__ == "__main__":
+     unittest.main()
+diff --git a/weather_service.py b/weather_service.py
+index 2c66c3a..f3af2ec 100644
+--- a/weather_service.py
++++ b/weather_service.py
+@@ -14,12 +14,50 @@ import msgpack
+ 
+ 
+ WEATHER_PRESETS = {
+-    "clear": dict(rain=0, roadwetness=0, snow=0, road_snow=0, maple_leaf=0, road_leaf=0, dust=0, fog=0),
+-    "rain": dict(rain=0.84, roadwetness=0.95, snow=0, road_snow=0, maple_leaf=0, road_leaf=0, dust=0, fog=0.12),
+-    "fog": dict(rain=0, roadwetness=0.05, snow=0, road_snow=0, maple_leaf=0, road_leaf=0, dust=0, fog=0.36),
+-    "snow": dict(rain=0, roadwetness=0, snow=0.58, road_snow=0.72, maple_leaf=0, road_leaf=0, dust=0, fog=0.08),
++    "clear": dict(
++        rain=0,
++        roadwetness=0,
++        snow=0,
++        road_snow=0,
++        maple_leaf=0,
++        road_leaf=0,
++        dust=0,
++        fog=0,
++    ),
++    "rain": dict(
++        rain=0.84,
++        roadwetness=0.95,
++        snow=0,
++        road_snow=0,
++        maple_leaf=0,
++        road_leaf=0,
++        dust=0,
++        fog=0.12,
++    ),
++    "fog": dict(
++        rain=0,
++        roadwetness=0.05,
++        snow=0,
++        road_snow=0,
++        maple_leaf=0,
++        road_leaf=0,
++        dust=0,
++        fog=0.36,
++    ),
++    "snow": dict(
++        rain=0,
++        roadwetness=0,
++        snow=0.58,
++        road_snow=0.72,
++        maple_leaf=0,
++        road_leaf=0,
++        dust=0,
++        fog=0.08,
++    ),
+ }
+-PARAMETER_IDS = dict(rain=0, roadwetness=1, snow=2, road_snow=3, maple_leaf=4, road_leaf=5, dust=6, fog=7)
++PARAMETER_IDS = dict(
++    rain=0, roadwetness=1, snow=2, road_snow=3, maple_leaf=4, road_leaf=5, dust=6, fog=7
++)
+ 
+ 
+ class WeatherUnavailable(Exception):
+@@ -37,7 +75,9 @@ class AirSimWeatherService:
+         deadline = time.monotonic() + self.timeout
+         current_method = "connect"
+         try:
+-            with socket.create_connection((self.host, self.port), timeout=self.timeout) as connection:
++            with socket.create_connection(
++                (self.host, self.port), timeout=self.timeout
++            ) as connection:
+                 unpacker = msgpack.Unpacker(raw=False, max_buffer_size=1024 * 1024)
+                 request_id = 0
+ 
+@@ -49,13 +89,24 @@ class AirSimWeatherService:
+                     if remaining <= 0:
+                         raise TimeoutError()
+                     connection.settimeout(remaining)
+-                    connection.sendall(msgpack.packb([0, request_id, method, list(args)], use_bin_type=True))
++                    connection.sendall(
++                        msgpack.packb(
++                            [0, request_id, method, list(args)], use_bin_type=True
++                        )
++                    )
+                     while True:
+                         for response in unpacker:
+-                            if not isinstance(response, list) or len(response) != 4 or response[0] != 1 or response[1] != request_id:
++                            if (
++                                not isinstance(response, list)
++                                or len(response) != 4
++                                or response[0] != 1
++                                or response[1] != request_id
++                            ):
+                                 raise WeatherUnavailable("AirSim RPC 返回了无效响应")
+                             if response[2] is not None:
+-                                raise WeatherUnavailable("AirSim 拒绝 RPC 调用，请检查模拟器日志与接口支持")
++                                raise WeatherUnavailable(
++                                    "AirSim 拒绝 RPC 调用，请检查模拟器日志与接口支持"
++                                )
+                             return response[3]
+                         remaining = deadline - time.monotonic()
+                         if remaining <= 0:
+@@ -68,7 +119,9 @@ class AirSimWeatherService:
+ 
+                 yield call
+         except (OSError, ValueError, msgpack.UnpackException) as error:
+-            raise WeatherUnavailable(f"AirSim RPC {current_method} 失败，请检查模拟器及 RPC 地址、端口；若天气部分生效，请重试完整预设") from error
++            raise WeatherUnavailable(
++                f"AirSim RPC {current_method} 失败，请检查模拟器及 RPC 地址、端口；若天气部分生效，请重试完整预设"
++            ) from error
+ 
+     def probe(self):
+         """Verify RPC availability without changing the simulation."""
