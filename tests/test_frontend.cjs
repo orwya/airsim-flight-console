@@ -15,6 +15,7 @@ function consolePage({
   connected = true,
   weatherOk = true,
   sceneControl = false,
+  plannerEnabled = false,
 } = {}) {
   const elements = new Map();
   function element() {
@@ -36,7 +37,8 @@ function consolePage({
       scrollTop: 0,
       setAttribute() {},
       removeAttribute() {},
-      addEventListener() {},
+      listeners: {},
+      addEventListener(type, callback) { this.listeners[type] = callback; },
       append() {},
       replaceChildren() {},
     };
@@ -63,6 +65,7 @@ function consolePage({
       body: {
         dataset: {
           xpraUrl: "http://example.test:10000/",
+          plannerEnabled: plannerEnabled ? "true" : "false",
           sceneControl: sceneControl ? "true" : "false",
         },
       },
@@ -333,4 +336,42 @@ test("late status responses cannot undo an accepted scene operation", async () =
   await stale;
   assert.equal(page.run("sceneBusy"), true);
   assert.equal(page.elements.get("#scene-overlay").hidden, false);
+});
+
+
+test("Planner blocks automatic focus changes but honors explicit user focus", async () => {
+  const page = consolePage({plannerEnabled: true});
+  await settle();
+  for (const state of ["running", "stopping", "connecting", "unknown"]) {
+    page.run("plannerState = '" + state + "'; focusAirSim()");
+  }
+  assert.equal(page.state.focuses, 0);
+  for (const state of ["running", "stopping", "connecting", "unknown"]) {
+    page.run("plannerState = '" + state + "'; focusAirSim(true)");
+  }
+  assert.equal(page.state.focuses, 4);
+});
+
+test("typing keeps input focus; clicking the picture explicitly returns keyboard focus", async () => {
+  const page = consolePage({plannerEnabled: true});
+  await settle();
+  const requestsBefore = page.state.requests.length;
+  page.run("plannerState='running'; document.activeElement=$('#command'); $('#command').listeners.focus()");
+  assert.equal(page.state.focuses, 0);
+  assert.equal(page.run("frameFocusTarget.hidden"), false);
+  assert.equal(page.run("document.activeElement === $('#command')"), true);
+  page.run("frameFocusTarget.listeners.pointerdown({button:0, preventDefault(){}})");
+  assert.equal(page.state.focuses, 1);
+  assert.equal(page.run("document.activeElement === $('#xpra-frame')"), true);
+  assert.equal(page.run("frameFocusTarget.hidden"), true);
+  assert.equal(page.state.requests.length, requestsBefore, "focus must not stop Planner or send RPC");
+});
+
+test("manual focus still respects scene readiness and open dialogs", async () => {
+  const page = consolePage({plannerEnabled: true, sceneControl:true});
+  await settle();
+  page.run("plannerState='running'; scenePhase='starting'; focusAirSim(true)");
+  assert.equal(page.state.focuses, 0);
+  page.run("scenePhase='ready'; modal.open=true; focusAirSim(true)");
+  assert.equal(page.state.focuses, 0);
 });

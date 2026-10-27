@@ -46,6 +46,32 @@ function toast(message) {
 }
 const DEFAULT_XPRA_URL = document.body.dataset.xpraUrl;
 const SCENE_CONTROL = document.body.dataset.sceneControl === "true";
+const plannerEnabled = document.body.dataset.plannerEnabled === "true";
+let plannerState = plannerEnabled ? "unknown" : "disabled";
+// Cross-origin iframe pointer events do not bubble to the parent page.
+// Arm a click target only when the command input receives focus.
+const frameFocusTarget = document.createElement("button");
+frameFocusTarget.type = "button";
+frameFocusTarget.className = "frame-focus-target";
+frameFocusTarget.textContent = "";
+frameFocusTarget.setAttribute("aria-label", "点击画面恢复键盘输入");
+frameFocusTarget.hidden = true;
+viewport.append(frameFocusTarget);
+$("#command").addEventListener("focus", () => {
+  frameFocusTarget.hidden = !remoteActive;
+});
+frameFocusTarget.addEventListener("pointerdown", event => {
+  if (event.button !== undefined && event.button !== 0) return;
+  event.preventDefault(); // Keep the browser from focusing this button after us.
+  focusAirSim(true);
+});
+frameFocusTarget.addEventListener("click", event => {
+  event.preventDefault(); // Keyboard activation also supports the click target.
+  focusAirSim(true);
+});
+$("#xpra-frame").addEventListener("focus", () => {
+  frameFocusTarget.hidden = true;
+});
 let sceneBusy = false;
 let scenePhase = "idle";
 let sceneInstance = null;
@@ -122,6 +148,7 @@ function connectXpra(value, remember = true) {
 }
 function disconnectXpra() {
   remoteActive = false;
+  frameFocusTarget.hidden = true;
   clearTimeout(connectionTimer);
   $("#xpra-frame").hidden = true;
   $("#xpra-frame").removeAttribute("src");
@@ -145,8 +172,11 @@ $("#retry-feed").addEventListener("click", () => {
 });
 $("#disconnect-feed").addEventListener("click", disconnectXpra);
 function focusAirSim(force = false) {
+  // Suppress unsolicited focus changes during an automatic task, while
+  // honoring the user's explicit choice to return to the remote window.
+  if (!force && plannerEnabled && plannerState !== "idle") return false;
   if (!remoteActive || modal.open || (SCENE_CONTROL && scenePhase !== "ready"))
-    return;
+    return false;
   const frame = $("#xpra-frame");
   const active = document.activeElement;
   // Do not interrupt typing or another action performed while the RPC was pending.
@@ -161,6 +191,8 @@ function focusAirSim(force = false) {
   frame.focus({ preventScroll: true });
   // Window.focus is permitted for a cross-origin iframe; do not inspect its DOM.
   frame.contentWindow?.focus();
+  frameFocusTarget.hidden = true;
+  return true;
 }
 $("#focus-feed").addEventListener("click", () => focusAirSim(true));
 
@@ -237,6 +269,7 @@ async function applyWeather(item, restoreInput = false) {
     return;
   const requestInstance = sceneInstance;
   weatherPending = true;
+  if (typeof renderPlanner === "function") renderPlanner();
   const list = $("#weather-list");
   const position = list.scrollTop;
   const status = $("#weather-status");
@@ -290,6 +323,7 @@ async function applyWeather(item, restoreInput = false) {
   } finally {
     clearTimeout(timer);
     weatherPending = false;
+    if (typeof renderPlanner === "function") renderPlanner();
     list.setAttribute("aria-busy", "false");
     renderList("weather");
     list.scrollTop = position;
@@ -299,6 +333,12 @@ async function applyWeather(item, restoreInput = false) {
 }
 renderList("scene");
 renderList("weather");
+// Update already-cached server templates without restarting the scene manager.
+const leftVehicleShortcut = document.querySelector('[data-command="飞到左前方的建筑附近"]');
+if (leftVehicleShortcut) {
+  leftVehicleShortcut.dataset.command = "飞到左前方的车辆附近";
+  leftVehicleShortcut.textContent = "左前方车辆";
+}
 document.querySelectorAll("[data-command]").forEach((button) =>
   button.addEventListener("click", () => {
     $("#command").value = button.dataset.command;
@@ -306,22 +346,6 @@ document.querySelectorAll("[data-command]").forEach((button) =>
   }),
 );
 const history = [];
-$("#command-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const command = $("#command").value.trim();
-  if (!command) {
-    $("#command").focus();
-    toast("请输入飞行任务，或选择一条快捷指令");
-    return;
-  }
-  history.unshift({
-    command,
-    time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
-  });
-  $("#command-feedback").textContent =
-    `已记录「${command}」。当前为 UI 演示，指令尚未发送至无人机。`;
-  $("#command").value = "";
-});
 $("#fullscreen").addEventListener("click", async () => {
   try {
     if (document.fullscreenElement) await document.exitFullscreen();
@@ -379,7 +403,7 @@ function openModal(type) {
       history.forEach((item) => {
         const row = document.createElement("div");
         row.className = "media-item";
-        row.textContent = `${item.time} · ${item.command} · 未执行（演示）`;
+        row.textContent = `${item.time} · ${item.command} · ${item.status || "状态未确认"}`;
         content.append(row);
       });
   }

@@ -71,6 +71,7 @@ async function pollScenes() {
       $("#airsim-status").dataset.state = sceneBusy ? "pending" : "error";
       $("#weather-status").textContent = "新场景就绪后将初始化晴朗";
     }
+    if (typeof renderPlanner === "function") renderPlanner();
     renderList("scene");
     if (!weatherPending) renderList("weather");
     if (state.phase === "ready" && !weatherInitialized && !weatherPending)
@@ -84,6 +85,7 @@ async function pollScenes() {
     $("#scene-overlay").hidden = false;
     $("#scene-overlay-text").textContent = "状态连接失败，暂时停止画面输入";
     $("#cleanup-scene").disabled = false;
+    if (typeof renderPlanner === "function") renderPlanner();
     renderList("scene");
     renderList("weather");
   } finally {
@@ -98,6 +100,7 @@ async function sceneRequest(path, body) {
   sceneRequestPending = true;
   sceneBusy = true;
   scenePhase = "stopping";
+  if (typeof renderPlanner === "function") renderPlanner();
   selected.scene = null;
   selected.weather = null;
   sceneInstance = null;
@@ -149,7 +152,8 @@ if (SCENE_CONTROL) {
         ...item,
         detail: item.name,
       }));
-      renderList("scene");
+      if (typeof renderPlanner === "function") renderPlanner();
+    renderList("scene");
     })
     .catch((error) => toast(error.message));
   pollScenes();

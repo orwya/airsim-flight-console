@@ -14,6 +14,7 @@ LOOPBACK = "127.0.0.1"  # AirSim RPC 只监听本机回环，与部署地址无�
 
 TIMEOUT_FIELDS = (
     "airsim_timeout",
+    "planner_timeout",
     "port_release_wait",
     "kill_wait",
     "xpra_ready_timeout",
@@ -44,6 +45,8 @@ class Settings:
     display: str = ":100"
     xpra_port: int = 10000
     airsim_settings: str = "/data/airsim/settings.json"
+    planner_port: int | None = None
+    planner_timeout: float = 5.0
     airsim_timeout: float = 5.0
     port_release_wait: float = 10.0
     kill_wait: float = 5.0
@@ -77,6 +80,11 @@ class Settings:
             raise ValueError("端口必须在 1-65535 之间")
         if len({self.http_port, self.xpra_port, self.rpc_port}) != 3:
             raise ValueError("后端端口、画面端口、RPC 端口必须互不相同")
+        if self.planner_port is not None:
+            if type(self.planner_port) is not int or not 1 <= self.planner_port <= 65535:
+                raise ValueError("--planner-port 必须在 1-65535 之间")
+            if self.planner_port in (self.http_port, self.xpra_port, self.rpc_port):
+                raise ValueError("Planner 端口不能与控制台、画面、RPC 端口相同")
         if not re.fullmatch(r":[1-9][0-9]{0,4}", self.display):
             raise ValueError("--display 必须形如 :100")
         for name in TIMEOUT_FIELDS:
@@ -97,6 +105,8 @@ def build_settings(args):
         xpra_port=args.xpra_port,
         airsim_settings=args.settings,
         airsim_timeout=args.airsim_timeout,
+        planner_port=args.planner_port,
+        planner_timeout=args.planner_timeout,
         port_release_wait=args.port_release_wait,
         kill_wait=args.kill_wait,
         xpra_ready_timeout=args.xpra_ready_timeout,

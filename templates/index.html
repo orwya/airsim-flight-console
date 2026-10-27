@@ -8,12 +8,8 @@
   <title>AirSim 飞行控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
-<body data-xpra-url="{{ xpra_url }}" data-scene-control="true">
-  <aside class="rail">
-    <button class="rail-button active" data-icon="dashboard" aria-label="飞行控制台" title="飞行控制台"></button>
-    <button class="rail-button" data-icon="route" data-modal="missions" aria-label="任务记录" title="任务记录"></button>
-    <button class="rail-button" data-icon="folder" data-modal="media" aria-label="媒体库" title="媒体库"></button>
-  </aside>
+<body data-xpra-url="{{ xpra_url }}" data-scene-control="true" data-planner-enabled="{{ 'true' if planner_enabled else 'false' }}" data-planner-timeout="{{ planner_timeout }}">
+
 
   <div class="app-shell">
     <main>
@@ -29,11 +25,25 @@
 
           <section class="command-card">
             <div class="section-title"><h2><span data-icon="terminal"></span>飞行指令</h2><span class="keyboard-hint">Enter 发送</span></div>
-            <form id="command-form"><label class="sr-only" for="command">输入无人机飞行指令</label><span class="prompt-symbol">⌘</span><input id="command" autocomplete="off" maxlength="250" placeholder="描述你想执行的任务，例如：起飞并上升至 20 米…"/><button class="send-button" type="submit">发送指令<span data-icon="arrow"></span></button></form>
-            <div class="suggestions"><span>试一试</span><button data-command="起飞并上升至 20 米">↗ 起飞至 20m</button><button data-command="环绕当前目标飞行一周">◎ 环绕飞行</button><button data-command="返回起飞点并降落">⌂ 返航降落</button></div>
+            <form id="command-form"><label class="sr-only" for="command">输入无人机飞行指令</label><span class="prompt-symbol">⌘</span><input id="command" autocomplete="off" maxlength="4000" placeholder="描述你想执行的任务，例如：飞到右前方第一辆红色汽车附近…"/><button class="send-button" id="planner-start" type="submit" disabled>开始执行<span data-icon="arrow"></span></button></form>
+            <div class="suggestions"><span>试一试</span><button data-command="飞到右前方第一辆红色汽车附近">红色汽车</button><button data-command="飞到左前方的车辆附近">左前方车辆</button></div>
+            <div class="planner-toolbar">
+              <span id="planner-status" role="status">Planner 状态未确认</span>
+              <span id="planner-task-id"></span>
+              <button type="button" id="planner-stop" class="scene-cleanup" disabled>停止当前任务</button>
+            </div>
+            <p id="planner-status-detail" class="weather-status" role="status"></p>
             <div class="command-feedback" id="command-feedback" role="status"></div>
+            <p id="planner-warning" class="planner-warning" hidden>自动任务执行中，手动键鼠输入可能干扰飞行。空闲不代表上一任务成功。</p>
+            <div class="planner-log-toolbar">
+              <strong>执行日志</strong><span id="planner-log-status" role="status">等待连接</span>
+              <label><input type="checkbox" id="planner-follow" checked> 跟随最新日志</label>
+              <button type="button" id="planner-clear">清空显示</button>
+            </div>
+            <pre id="planner-logs" aria-label="Planner 执行日志" tabindex="0"></pre>
+            <p class="planner-hint">刷新或关闭页面不会停止任务；202 仅表示接收，执行结果请查看日志。</p>
           </section>
-          <div class="bottom-note"><span data-icon="shield"></span>每一次探索，都从安全出发。<span>飞行指令接口待接入，当前仅展示远程窗口。</span></div>
+          <div class="bottom-note"><span data-icon="shield"></span>每一次探索，都从安全出发。<span>自然语言任务由 Planner 执行，场景切换前将等待任务停止。</span></div>
         </div>
 
         <aside class="control-column">
@@ -62,5 +72,6 @@
   <div id="toast" class="toast" role="status"></div>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
   <script src="{{ url_for('static', filename='scenes.js') }}"></script>
+  <script src="{{ url_for('static', filename='planner.js') }}"></script>
 </body>
 </html>
