@@ -51,7 +51,7 @@ class FlaskConsoleTests(unittest.TestCase):
         configuration = self.client.get("/api/config").json
         self.assertEqual(configuration["xpra_url"], "http://192.0.2.10:10000/")
         self.assertEqual(configuration["console_url"], "http://192.0.2.10:5173/")
-        self.assertFalse(configuration["flight_control_available"])
+        self.assertEqual(configuration["planner_url"], "")
 
     def test_source_files_are_not_exposed(self):
         for path in [

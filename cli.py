@@ -14,8 +14,7 @@ def build_parser():
     parser.add_argument("--display", default=":100")
     parser.add_argument("--xpra-port", type=int, default=10000)
     parser.add_argument("--settings", default="/data/airsim/settings.json")
-    parser.add_argument("--planner-port", type=int, help="本机 Planner HTTP 端口；省略则关闭")
-    parser.add_argument("--planner-timeout", type=float, default=5.0)
+    parser.add_argument("--planner-port", type=int, help="浏览器直连 Planner 的端口；按 --ip 拼成地址预填到页面，省略则留空")
     parser.add_argument("--airsim-timeout", type=float, default=5.0)
     for option, default in (
         ("port-release-wait", 10),

@@ -15,7 +15,7 @@ function consolePage({
   connected = true,
   weatherOk = true,
   sceneControl = false,
-  plannerEnabled = false,
+  plannerUrl = "",
 } = {}) {
   const elements = new Map();
   function element() {
@@ -65,7 +65,7 @@ function consolePage({
       body: {
         dataset: {
           xpraUrl: "http://example.test:10000/",
-          plannerEnabled: plannerEnabled ? "true" : "false",
+          plannerUrl,
           sceneControl: sceneControl ? "true" : "false",
         },
       },
@@ -340,7 +340,7 @@ test("late status responses cannot undo an accepted scene operation", async () =
 
 
 test("Planner blocks automatic focus changes but honors explicit user focus", async () => {
-  const page = consolePage({plannerEnabled: true});
+  const page = consolePage({plannerUrl: "http://planner.test:8080"});
   await settle();
   for (const state of ["running", "stopping", "connecting", "unknown"]) {
     page.run("plannerState = '" + state + "'; focusAirSim()");
@@ -353,7 +353,7 @@ test("Planner blocks automatic focus changes but honors explicit user focus", as
 });
 
 test("typing keeps input focus; clicking the picture explicitly returns keyboard focus", async () => {
-  const page = consolePage({plannerEnabled: true});
+  const page = consolePage({plannerUrl: "http://planner.test:8080"});
   await settle();
   const requestsBefore = page.state.requests.length;
   page.run("plannerState='running'; document.activeElement=$('#command'); $('#command').listeners.focus()");
@@ -368,7 +368,7 @@ test("typing keeps input focus; clicking the picture explicitly returns keyboard
 });
 
 test("manual focus still respects scene readiness and open dialogs", async () => {
-  const page = consolePage({plannerEnabled: true, sceneControl:true});
+  const page = consolePage({plannerUrl: "http://planner.test:8080", sceneControl:true});
   await settle();
   page.run("plannerState='running'; scenePhase='starting'; focusAirSim(true)");
   assert.equal(page.state.focuses, 0);

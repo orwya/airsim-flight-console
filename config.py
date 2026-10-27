@@ -14,7 +14,6 @@ LOOPBACK = "127.0.0.1"  # AirSim RPC 只监听本机回环，与部署地址无�
 
 TIMEOUT_FIELDS = (
     "airsim_timeout",
-    "planner_timeout",
     "port_release_wait",
     "kill_wait",
     "xpra_ready_timeout",
@@ -46,7 +45,6 @@ class Settings:
     xpra_port: int = 10000
     airsim_settings: str = "/data/airsim/settings.json"
     planner_port: int | None = None
-    planner_timeout: float = 5.0
     airsim_timeout: float = 5.0
     port_release_wait: float = 10.0
     kill_wait: float = 5.0
@@ -63,6 +61,11 @@ class Settings:
     @property
     def xpra_url(self):
         return f"http://{self.ip}:{self.xpra_port}/"
+
+    @property
+    def planner_url(self):
+        """浏览器直连 Planner 的地址。未配置端口时为空，页面可手动填写。"""
+        return f"http://{self.ip}:{self.planner_port}" if self.planner_port else ""
 
     def __post_init__(self):
         if self.rpc_port is None:
@@ -106,7 +109,6 @@ def build_settings(args):
         airsim_settings=args.settings,
         airsim_timeout=args.airsim_timeout,
         planner_port=args.planner_port,
-        planner_timeout=args.planner_timeout,
         port_release_wait=args.port_release_wait,
         kill_wait=args.kill_wait,
         xpra_ready_timeout=args.xpra_ready_timeout,

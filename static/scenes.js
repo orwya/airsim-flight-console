@@ -134,13 +134,28 @@ async function sceneRequest(path, body) {
     await pollScenes();
   }
 }
-function switchScene(id) {
+// 后端不再检查 Planner。切换会重置 AirSim，所以由页面在提交前问一次。
+let scenePreflightPending = false;
+async function scenePreflight() {
+  if (scenePreflightPending) return false;
+  if (typeof plannerPreflight !== "function") return true;
+  scenePreflightPending = true;
+  try {
+    return await plannerPreflight();
+  } finally {
+    scenePreflightPending = false;
+  }
+}
+async function switchScene(id) {
+  if (sceneBusy || sceneRequestPending) return;
+  if (!(await scenePreflight())) return;
   return sceneRequest("/api/switch", { scene_id: id });
 }
 if (SCENE_CONTROL) {
-  $("#cleanup-scene").addEventListener("click", () =>
-    sceneRequest("/api/cleanup", {}),
-  );
+  $("#cleanup-scene").addEventListener("click", async () => {
+    if (sceneBusy || sceneRequestPending) return;
+    if (await scenePreflight()) sceneRequest("/api/cleanup", {});
+  });
   $("#scene-overlay").hidden = false;
   fetch("/api/scenes", { cache: "no-store" })
     .then((response) => {

@@ -8,12 +8,12 @@
   <title>AirSim 飞行控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
-<body data-xpra-url="{{ xpra_url }}" data-scene-control="true" data-planner-enabled="{{ 'true' if planner_enabled else 'false' }}" data-planner-timeout="{{ planner_timeout }}">
+<body data-xpra-url="{{ xpra_url }}" data-scene-control="true" data-planner-url="{{ planner_url }}">
 
 
   <div class="app-shell">
     <main>
-      <div class="console-toolbar"><button class="outline-button" id="connect"><span data-icon="link"></span><span id="connect-label">连接 AirSim</span><span class="small-arrow">↗</span></button></div>
+      <div class="console-toolbar"><button class="outline-button" id="connect"><span data-icon="link"></span><span id="connect-label">连接设置</span><span class="small-arrow">↗</span></button></div>
 
       <div class="workspace">
         <div class="flight-column">
@@ -43,7 +43,7 @@
             <pre id="planner-logs" aria-label="Planner 执行日志" tabindex="0"></pre>
             <p class="planner-hint">刷新或关闭页面不会停止任务；202 仅表示接收，执行结果请查看日志。</p>
           </section>
-          <div class="bottom-note"><span data-icon="shield"></span>每一次探索，都从安全出发。<span>自然语言任务由 Planner 执行，场景切换前将等待任务停止。</span></div>
+          <div class="bottom-note"><span data-icon="shield"></span>每一次探索，都从安全出发。<span>自然语言任务由 Planner 直接执行；切换场景前会检查任务状态。</span></div>
         </div>
 
         <aside class="control-column">

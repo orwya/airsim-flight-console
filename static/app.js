@@ -45,8 +45,18 @@ function toast(message) {
   toastTimer = setTimeout(() => $("#toast").classList.remove("visible"), 3600);
 }
 const DEFAULT_XPRA_URL = document.body.dataset.xpraUrl;
+const DEFAULT_PLANNER_URL = document.body.dataset.plannerUrl || "";
 const SCENE_CONTROL = document.body.dataset.sceneControl === "true";
-const plannerEnabled = document.body.dataset.plannerEnabled === "true";
+// Planner 由浏览器直连：页面保存的地址优先，其次用后端下发的默认值。
+function savedPlannerUrl() {
+  try {
+    return localStorage.getItem("airsim-planner-url") || DEFAULT_PLANNER_URL;
+  } catch {
+    return DEFAULT_PLANNER_URL;
+  }
+}
+let plannerBase = savedPlannerUrl();
+let plannerEnabled = Boolean(plannerBase);
 let plannerState = plannerEnabled ? "unknown" : "disabled";
 // Cross-origin iframe pointer events do not bubble to the parent page.
 // Arm a click target only when the command input receives focus.
@@ -375,9 +385,10 @@ const modal = $("#modal");
 function openModal(type) {
   const content = $("#modal-content");
   if (type === "connect") {
-    $("#modal-title").textContent = "连接 AirSim 画面";
+    $("#modal-title").textContent = "连接设置";
     content.innerHTML =
-      '<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接用于显示 AirSim 应用窗口；右侧天气按钮通过 RPC 独立控制天气。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>';
+      '<form id="xpra-connect-form"><p>嵌入服务器现有的 xpra 网页，显示 AirSim 窗口。此连接用于显示 AirSim 应用窗口；右侧天气按钮通过 RPC 独立控制天气。</p><label class="modal-field" for="endpoint">xpra 网页地址</label><input class="modal-input" id="endpoint" placeholder="172.27.137.174:10000" required/><p>若画面为空或浏览器拒绝嵌入，可使用画面下方的“独立打开”检查。地址必须能从当前电脑访问。共享模式要求服务器开启 sharing=yes；可在服务器执行 xpra control :100 set-sharing yes。</p><p>当前控制台来源：<code id="console-origin"></code>。服务器的 frame-ancestors 必须允许此来源。</p><button class="modal-action" type="submit">连接画面</button></form>' +
+      (typeof plannerSettingsHTML === "function" ? plannerSettingsHTML() : "");
     $("#console-origin").textContent = location.origin;
     let saved = "";
     try {
@@ -393,6 +404,8 @@ function openModal(type) {
         toast(error.message);
       }
     });
+    // Planner 那块的渲染与绑定交给 planner.js，本函数只负责拼出弹窗结构。
+    if (typeof mountPlannerSettings === "function") mountPlannerSettings();
   }
   if (type === "missions") {
     $("#modal-title").textContent = "任务记录";

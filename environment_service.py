@@ -9,7 +9,6 @@ import time
 import uuid
 
 from config import LOOPBACK, Settings
-from planner_service import PlannerError
 from scene_launcher import SCENES, get_commands
 from scene_processes import (
     ProcessRuntime,
@@ -28,7 +27,6 @@ class SceneBusy(SceneError):
 class EnvironmentService:
     def __init__(self, settings: Settings, weather: AirSimWeatherService):
         self.settings = settings
-        self.planner = None
         self.weather = weather
         self.startup_weather = AirSimWeatherService(LOOPBACK, weather.port, 30)
         self.root = settings.root
@@ -99,8 +97,7 @@ class EnvironmentService:
     def submit(self, scene_id=None, cleanup=False):
         if not cleanup and (not isinstance(scene_id, str) or scene_id not in SCENES):
             raise ValueError("未知场景")
-        acquired = (self.gate.acquire(timeout=2 * self.settings.planner_timeout + 1)
-                    if self.planner else self.gate.acquire(blocking=False))
+        acquired = self.gate.acquire(blocking=False)
         if not acquired:
             raise SceneBusy("场景或天气正在处理中，请稍后重试")
         try:
@@ -182,12 +179,6 @@ class EnvironmentService:
         try:
             if not cleanup:
                 self._check_scene_files(scene_id)
-            if self.planner:
-                self.runtime.holders()  # Reject foreign listeners before affecting Planner.
-                self._set(stage="正在确认 Planner 已停止")
-                has_scene = any(port_alive(p) for p in (self.settings.xpra_port, self.settings.rpc_port))
-                self.planner.wait_idle(self._check_cancel,
-                    lambda text: self._set(stage=text), before_stop=True, has_scene=has_scene)
             self._check_cancel()
             self._stop_current(scene_id)
             if cleanup:
@@ -204,9 +195,6 @@ class EnvironmentService:
             self._wait_ready(scene_id)
             self._set(phase="initializing", stage="正在初始化晴朗天气")
             self.startup_weather.apply("clear")
-            if self.planner:
-                self._set(stage="晴朗已初始化，等待 Planner 连接准备完成")
-                self.planner.wait_idle(self._check_cancel, lambda text: self._set(stage=text))
             self._set(
                 phase="ready",
                 scene=scene_id,
@@ -291,26 +279,6 @@ class EnvironmentService:
             raise SceneError("监听进程与目标场景不匹配")
         self.weather.probe()
         return self.runtime.window_ready(scene_id)
-
-    def submit_task(self, payload):
-        if self.planner is None:
-            raise PlannerError("Planner 未配置", 503, "planner_disabled")
-        if not self.gate.acquire(timeout=2 * self.settings.planner_timeout + 1):
-            raise SceneBusy("场景或天气正在处理中，请稍后重试")
-        try:
-            if self.snapshot()["phase"] != "ready":
-                raise SceneBusy("场景尚未就绪")
-            body, status = self.planner.request("GET", "/api/status")
-            if status != 200:
-                return body, status
-            state = body.get("state")
-            if state not in ("idle", "running", "stopping", "connecting"):
-                raise PlannerError("无法确认 Planner 状态", code="planner_protocol")
-            if state != "idle":
-                return {"detail": {"state": state, "message": "Planner is " + state + "."}}, 503 if state == "connecting" else 409
-            return self.planner.submit(payload)
-        finally:
-            self.gate.release()
 
     def apply_weather(self, weather, instance_id):
         if not self.gate.acquire(blocking=False):

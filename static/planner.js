@@ -1,4 +1,12 @@
-/* Planner state/log streams are independent. POST requests are never retried. */
+/* Planner 由浏览器直连；后端不代理、不转发、不探活。 */
+const PLANNER_STATUS_TIMEOUT = 5000;
+const PLANNER_WRITE_TIMEOUT = 25000;
+const PLANNER_POLL_INTERVAL = 1000;
+const PLANNER_STOP_WAIT_MS = 20000;
+const PLANNER_STOP_POLL_MS = 500;
+const PLANNER_LOG_LIMIT = 2000;
+const PLANNER_LOG_BOTTOM_PX = 40;
+const PLANNER_STORAGE_KEY = "airsim-planner-url";
 let plannerPending = false;
 let plannerEpoch = 0;
 let plannerStatusPending = false;
@@ -7,14 +15,12 @@ let plannerCursor = 0;
 let plannerLogsEpoch = 0;
 let plannerLogRows = [];
 let plannerSeenIds = new Set();
-let plannerLogError = "";
 let plannerTaskId = "";
 const plannerLabels = {
   disabled: "Planner 未配置", unknown: "Planner 状态未确认",
   connecting: "Planner 连接准备中", idle: "可接受新任务",
   running: "任务执行中（含解析、规划和飞行）", stopping: "正在停止任务",
 };
-const plannerTimeout = Number(document.body.dataset.plannerTimeout || 5);
 function renderPlanner() {
   $("#planner-status").textContent = plannerLabels[plannerState] || plannerLabels.unknown;
   $("#planner-status").dataset.state = plannerState;
@@ -24,12 +30,12 @@ function renderPlanner() {
   $("#planner-stop").disabled = !plannerEnabled || plannerPending || plannerState !== "running";
   $("#planner-warning").hidden = plannerState !== "running" && plannerState !== "stopping";
 }
-async function plannerRequest(path, options = {}) {
+async function plannerRequest(path, options = {}, base = plannerBase) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(),
-    (options.method === "POST" ? 4 * plannerTimeout + 5 : plannerTimeout + 3) * 1000);
+  const limit = options.method === "POST" ? PLANNER_WRITE_TIMEOUT : PLANNER_STATUS_TIMEOUT;
+  const timer = setTimeout(() => controller.abort(), limit);
   try {
-    const response = await fetch("/api/planner" + path, {
+    const response = await fetch(base + path, {
       ...options, credentials: "omit", cache: "no-store", signal: controller.signal,
     });
     const body = await response.json();
@@ -44,6 +50,12 @@ async function plannerRequest(path, options = {}) {
       throw error;
     }
     return {body, status: response.status};
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("Planner 请求超时");
+    // 跨域被拒和端口不可达在浏览器里都是 TypeError，只能给出合并后的提示。
+    if (error.name === "TypeError")
+      throw new Error("浏览器无法访问 " + base + "，请检查地址、端口和跨域设置");
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -53,15 +65,19 @@ function plannerStateFrom(body) {
     throw new Error("Planner 返回无效状态");
   return body.state;
 }
+async function plannerStatus(base) {
+  const {body} = await plannerRequest("/api/status", {}, base);
+  return plannerStateFrom(body);
+}
 async function pollPlannerStatus() {
   if (!plannerEnabled || plannerStatusPending) return;
   plannerStatusPending = true;
   const epoch = plannerEpoch;
   try {
     if (document.hidden) return;
-    const {body} = await plannerRequest("/status");
+    const state = await plannerStatus();
     if (epoch !== plannerEpoch || plannerPending) return;
-    plannerState = plannerStateFrom(body);
+    plannerState = state;
   } catch (error) {
     if (epoch === plannerEpoch && !plannerPending) {
       plannerState = "unknown";
@@ -71,18 +87,18 @@ async function pollPlannerStatus() {
     plannerStatusPending = false;
     if (plannerState !== "unknown") $("#planner-status-detail").textContent = "";
     renderPlanner();
-    setTimeout(pollPlannerStatus, 1000);
+    setTimeout(pollPlannerStatus, PLANNER_POLL_INTERVAL);
   }
 }
 function renderPlannerLogs() {
   const box = $("#planner-logs");
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < PLANNER_LOG_BOTTOM_PX;
   box.textContent = plannerLogRows.map(row => row.text).join("\n");
   if ($("#planner-follow").checked && atBottom) box.scrollTop = box.scrollHeight;
 }
 function appendPlannerRows(rows) {
   plannerLogRows.push(...rows);
-  plannerLogRows = plannerLogRows.slice(-2000);
+  plannerLogRows = plannerLogRows.slice(-PLANNER_LOG_LIMIT);
   plannerSeenIds = new Set(plannerLogRows.filter(row => row.id !== undefined).map(row => row.id));
   renderPlannerLogs();
 }
@@ -93,7 +109,7 @@ async function pollPlannerLogs() {
   const epoch = plannerLogsEpoch;
   try {
     if (document.hidden) return;
-    const {body} = await plannerRequest("/logs?cursor=" + sentCursor);
+    const {body} = await plannerRequest("/api/logs?cursor=" + sentCursor);
     if (epoch !== plannerLogsEpoch) return;
     if (!Number.isSafeInteger(body.next_cursor) || body.next_cursor < 0 ||
         typeof body.truncated !== "boolean" || !Array.isArray(body.items) ||
@@ -119,14 +135,12 @@ async function pollPlannerLogs() {
     }
     appendPlannerRows(rows);
     plannerCursor = body.next_cursor;
-    plannerLogError = "";
     $("#planner-log-status").textContent = "日志已连接";
   } catch (error) {
-    plannerLogError = error.message;
-    $("#planner-log-status").textContent = "日志连接异常：" + plannerLogError;
+    $("#planner-log-status").textContent = "日志连接异常：" + error.message;
   } finally {
     plannerLogsPending = false;
-    setTimeout(pollPlannerLogs, 1000);
+    setTimeout(pollPlannerLogs, PLANNER_POLL_INTERVAL);
   }
 }
 async function plannerCommand(stop = false) {
@@ -144,7 +158,7 @@ async function plannerCommand(stop = false) {
     time: new Date().toLocaleTimeString("zh-CN", {hour12: false}), status: "提交中"};
   if (record) history.unshift(record);
   try {
-    const {body, status} = await plannerRequest(stop ? "/stop" : "/tasks", stop
+    const {body, status} = await plannerRequest(stop ? "/api/stop" : "/api/tasks", stop
       ? {method: "POST"}
       : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({instruction})});
     const nextState = plannerStateFrom(body);
@@ -175,6 +189,163 @@ async function plannerCommand(stop = false) {
     pollPlannerStatus();
   }
 }
+function normalizePlannerBase(value) {
+  const text = value.trim().replace(/\/+$/, "");
+  if (!text) return "";
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw new Error("请输入完整地址，例如 http://172.27.137.174:8080");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol))
+    throw new Error("地址必须以 http:// 或 https:// 开头");
+  if (parsed.username || parsed.password) throw new Error("地址中不要包含用户名或密码");
+  if (parsed.search || parsed.hash) throw new Error("地址中不要包含查询串或片段");
+  return text;
+}
+function applyPlannerBase(value) {
+  plannerBase = value;
+  plannerEnabled = Boolean(value);
+  plannerState = plannerEnabled ? "unknown" : "disabled";
+  plannerEpoch++;
+  plannerLogsEpoch++;
+  plannerPending = false;
+  plannerStatusPending = false;
+  plannerLogsPending = false;
+  plannerCursor = 0;
+  plannerSeenIds.clear();
+  plannerLogRows.forEach(row => delete row.id);
+  renderPlanner();
+  if (plannerEnabled) {
+    pollPlannerStatus();
+    pollPlannerLogs();
+  } else {
+    showPlannerDisabledNotice();
+  }
+}
+function showPlannerDisabledNotice() {
+  $("#command-feedback").textContent = "Planner 未配置；在右上角“连接设置”里填写 Planner 地址。";
+  $("#planner-log-status").textContent = "Planner 未配置";
+}
+// 设置弹窗可能未打开，写入前先确认提示元素存在。
+function setPlannerResult(text) {
+  const box = $("#planner-test-result");
+  if (box) box.textContent = text;
+}
+function plannerSettingsHTML() {
+  return '<div class="planner-settings"><p>Planner 由页面直接连接，后端不转发。启动时加 --planner-port 会自动填入；也可在这里手动填写，Planner 的跨域设置必须允许本页来源。</p><label class="modal-field" for="planner-endpoint">Planner 地址</label><input class="modal-input" id="planner-endpoint" placeholder="http://172.27.137.174:8080"/><p class="weather-status" id="planner-test-result" role="status"></p><button class="modal-action" type="button" id="planner-test">测试连接</button><button class="modal-action" type="button" id="planner-save">保存 Planner 地址</button></div>';
+}
+function mountPlannerSettings() {
+  $("#planner-endpoint").value = plannerBase;
+  setPlannerResult(plannerEnabled ? "" : "尚未配置 Planner 地址，可在这里填写后保存");
+  $("#planner-test").addEventListener("click", () =>
+    plannerTestAddress($("#planner-endpoint").value));
+  $("#planner-save").addEventListener("click", () =>
+    plannerSaveAddress($("#planner-endpoint").value));
+}
+async function plannerTestAddress(value) {
+  setPlannerResult("正在连接…");
+  try {
+    const base = normalizePlannerBase(value);
+    if (!base) throw new Error("请先填写地址");
+    setPlannerResult("已连接，当前状态：" + (plannerLabels[await plannerStatus(base)] || "未知"));
+  } catch (error) {
+    setPlannerResult(error.message);
+  }
+}
+function plannerSaveAddress(value) {
+  try {
+    const base = normalizePlannerBase(value);
+    try {
+      if (base) localStorage.setItem(PLANNER_STORAGE_KEY, base);
+      else localStorage.removeItem(PLANNER_STORAGE_KEY);
+    } catch {}
+    const fallback = base || DEFAULT_PLANNER_URL;
+    applyPlannerBase(fallback);
+    setPlannerResult(
+      base
+        ? "已保存：" + base
+        : fallback
+          ? "已清除浏览器保存的地址，改用启动参数指定的地址：" + fallback
+          : "已清除地址；Planner 未配置。",
+    );
+  } catch (error) {
+    setPlannerResult(error.message);
+  }
+}
+// 三个按钮的询问框：返回 value，关闭弹窗返回 null。测试可整体替换本函数。
+function plannerAsk(message, options) {
+  return new Promise(resolve => {
+    $("#modal-title").textContent = "切换场景前的检查";
+    const content = $("#modal-content");
+    content.replaceChildren();
+    const text = document.createElement("p");
+    text.textContent = message;
+    content.append(text);
+    for (const option of options) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "modal-action";
+      button.textContent = option.label;
+      button.addEventListener("click", () => {
+        modal.close();
+        resolve(option.value);
+      });
+      content.append(button);
+    }
+    modal.addEventListener("close", () => resolve(null), { once: true });
+    if (!modal.open) modal.showModal();
+  });
+}
+async function stopThenSwitch() {
+  try {
+    await plannerRequest("/api/stop", { method: "POST" });
+  } catch (error) {
+    $("#command-feedback").textContent = "停止请求结果未确认：" + error.message;
+    return false;
+  }
+  const deadline = Date.now() + PLANNER_STOP_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, PLANNER_STOP_POLL_MS));
+    let state;
+    try {
+      state = await plannerStatus();
+    } catch {
+      continue;
+    }
+    if (state === "idle") {
+      plannerState = "idle";
+      renderPlanner();
+      return true;
+    }
+  }
+  $("#command-feedback").textContent = "停止未确认，未切换场景。请查看执行日志。";
+  return false;
+}
+// 后端不再检查 Planner。唯一需要确认的情况是 Planner 正在飞：切换会重置 AirSim。
+async function plannerPreflight() {
+  if (!plannerEnabled) return true;
+  let state;
+  try {
+    state = await plannerStatus();
+  } catch {
+    // 连不上就没有正在执行的任务需要保护。连接异常只留在状态栏，不弹窗、不拦切换。
+    return true;
+  }
+  if (state !== "running") return true;
+  const choice = await plannerAsk(
+    "Planner 正在控制无人机飞行。切换场景会重置 AirSim，任务随之中断。",
+    [
+      { value: "stop", label: "先停止任务再切换" },
+      { value: "switch", label: "直接切换" },
+      { value: "cancel", label: "取消" },
+    ],
+  );
+  if (choice === "switch") return true;
+  if (choice === "stop") return await stopThenSwitch();
+  return false;
+}
 $("#command-form").addEventListener("submit", event => {
   event.preventDefault();
   plannerCommand(false);
@@ -194,6 +365,5 @@ $("#command").value = "";
 renderPlanner();
 if (plannerEnabled) { pollPlannerStatus(); pollPlannerLogs(); }
 else {
-  $("#command-feedback").textContent = "Planner 未配置；启动控制台时指定 --planner-port 后启用。";
-  $("#planner-log-status").textContent = "Planner 未配置";
+  showPlannerDisabledNotice();
 }
