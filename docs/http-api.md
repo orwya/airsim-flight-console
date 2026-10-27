@@ -20,7 +20,7 @@ POST 使用 Content-Type: application/json。带 Origin 时必须与控制台来
 
 flight_control_available 和 planner_control_available 只表示启动时是否配置 Planner 端口，不表示上游当前可达或无人机已经可控。
 
-场景 ID 固定为 AirSimNH、AbandonedPark、MSBuild2018；available 来自程序存在性和执行权限检查，不代表启动必然成功。
+场景 ID 固定为 airsimnh、abandonedpark、msbuild2018（区分大小写）；available 来自程序存在性和执行权限检查，不代表启动必然成功。
 
 状态快照包含 phase、stage、error、scene、target_scene、weather、instance_id、manager_id、revision、operation_id、completed_operation_id、端口与清理信息。客户端应以实际返回字段为准。phase 包括 idle、stopping、starting、initializing、ready、error。
 
@@ -33,7 +33,7 @@ flight_control_available 和 planner_control_available 只表示启动时是否�
 
 POST /api/switch 请求示例：
 
-    {"scene_id": "AirSimNH"}
+    {"scene_id": "airsimnh"}
 
 新切换返回 202 和状态快照，随后轮询 GET /api/status。已就绪的同一受管场景可返回 200。202 仅表示操作被接受，启动失败会在后续状态中报告。
 
