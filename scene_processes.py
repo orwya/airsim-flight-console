@@ -82,20 +82,84 @@ def descendants(pid):
     return result
 
 
-def kill_verified_tree(pid, expected):
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_verified_tree(pid, expected, wait, interval):
+    """先发 SIGTERM 让进程自己收尾，到点还活着才 SIGKILL。
+
+    Xvfb 只在正常退出时删除 /tmp/.X{n}-lock 和 /tmp/.X11-unix/X{n}。
+    直接 SIGKILL 会留下这两个文件，下次在同一显示号上无法启动。
+    """
     if identity(pid) != expected:
         return []
-    captured = descendants(pid)
-    killed = []
-    for child, before in captured:
-        now = identity(child)
-        if now and now == before and now[1] == os.getuid():
+    captured = [
+        (target, before)
+        for target, before in descendants(pid)
+        if before[1] == os.getuid()
+    ]
+    for target, before in captured:
+        if identity(target) == before:
             try:
-                os.kill(child, signal.SIGKILL)
-                killed.append(child)
+                os.kill(target, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-    return killed
+    deadline = time.monotonic() + wait
+    alive = captured
+    while alive and time.monotonic() < deadline:
+        time.sleep(interval)
+        alive = [
+            (target, before) for target, before in alive if identity(target) == before
+        ]
+    for target, before in alive:
+        if identity(target) == before:
+            try:
+                os.kill(target, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    return [target for target, _ in captured]
+
+
+X11_SOCKET_DIR = Path("/tmp/.X11-unix")
+
+
+def display_files(display, lock_dir=Path("/tmp"), socket_dir=X11_SOCKET_DIR):
+    number = display[1:]
+    return lock_dir / f".X{number}-lock", socket_dir / f"X{number}"
+
+
+def reclaim_stale_display(display, lock_dir=Path("/tmp"), socket_dir=X11_SOCKET_DIR):
+    """清理已被强杀的 Xvfb 留下的锁文件与 socket。
+
+    只在锁文件里的 PID 已不存在、且文件属于当前用户时删除。
+    进程还活着就报错，不动正在使用的显示号。
+    """
+    lock, socket_path = display_files(display, lock_dir, socket_dir)
+    if not lock.exists():
+        return None
+    try:
+        pid = int(lock.read_text().strip() or "0")
+    except (OSError, ValueError) as error:
+        raise SceneError(f"无法读取显示锁文件 {lock}：{error}") from error
+    if pid <= 0:
+        raise SceneError(f"无法识别显示锁文件 {lock} 中的 PID：{pid}")
+    if pid_alive(pid):
+        raise SceneError(
+            f"显示 {display} 仍被 PID {pid} 占用；先停止它，或改用其他 --display"
+        )
+    owner = lock.stat().st_uid
+    if owner != os.getuid():
+        raise SceneError(f"显示锁文件 {lock} 属于 UID {owner}，需要该用户或 root 处理")
+    lock.unlink()
+    socket_path.unlink(missing_ok=True)
+    return str(lock)
 
 
 class ProcessRuntime:
@@ -181,7 +245,11 @@ class ProcessRuntime:
             time.sleep(self.settings.poll_interval)
         # Re-read and revalidate ownership, including PID identity, before a forced kill.
         for pid, (_, before) in self.holders().items():
-            killed.extend(kill_verified_tree(pid, before))
+            killed.extend(
+                terminate_verified_tree(
+                    pid, before, self.settings.kill_wait, self.settings.poll_interval
+                )
+            )
         deadline = time.monotonic() + self.settings.kill_wait
         while time.monotonic() < deadline:
             if not any(

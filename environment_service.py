@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import fcntl
+import logging
 import os
 import subprocess
 import threading
@@ -14,10 +15,13 @@ from scene_processes import (
     ProcessRuntime,
     SceneError,
     identity,
-    kill_verified_tree,
     port_alive,
+    reclaim_stale_display,
+    terminate_verified_tree,
 )
 from weather_service import WeatherUnavailable, AirSimWeatherService
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SceneBusy(SceneError):
@@ -160,11 +164,20 @@ class EnvironmentService:
         )
 
     def _cleanup_launch(self):
+        """先 SIGTERM 让进程自己收尾，超时才 SIGKILL。
+
+        强杀 Xvfb 会留下 /tmp/.X{n}-lock，导致下次无法启动。
+        """
         if self.process:
             before = self.process_identity
             now = identity(self.process.pid)
             if before and now and now[:2] == before[:2] and self.process.poll() is None:
-                kill_verified_tree(self.process.pid, now)
+                terminate_verified_tree(
+                    self.process.pid,
+                    now,
+                    self.settings.kill_wait,
+                    self.settings.poll_interval,
+                )
             try:
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
@@ -243,8 +256,11 @@ class EnvironmentService:
             stage=f"正在启动 {SCENES[scene_id].name}",
         )
         start, _ = get_commands(scene_id, self.settings, self.runtime.path)
+        reclaimed = reclaim_stale_display(self.settings.display)
         with open(self.runtime.path / "logs" / "launcher.log", "a") as log:
             log.write(f"\n--- {time.time()} {scene_id} {instance} ---\n")
+            if reclaimed:
+                log.write(f"removed stale display lock {reclaimed}\n")
             log.flush()
             self.process = subprocess.Popen(
                 start,
@@ -328,7 +344,7 @@ class EnvironmentService:
                 self.runtime.stop(stop)
                 self._cleanup_launch()
             except Exception:
-                pass
+                LOGGER.exception("退出清理失败")
             finally:
                 self.gate.release()
                 self.lease.close()

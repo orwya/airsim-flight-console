@@ -58,7 +58,7 @@ class SceneTests(unittest.TestCase):
                 "environment_service.identity",
                 return_value=(1, os.getuid(), "fake", []),
             ),
-            patch("environment_service.kill_verified_tree") as kill,
+            patch("environment_service.terminate_verified_tree") as kill,
         ):
             state, accepted = self.service.submit("airsimnh")
             self.service.worker.join(2)
@@ -169,7 +169,7 @@ class SceneTests(unittest.TestCase):
                 "scene_processes.identity",
                 return_value=(1, os.getuid(), "/unknown", ["unknown"]),
             ),
-            patch("scene_processes.kill_verified_tree") as kill,
+            patch("scene_processes.terminate_verified_tree") as kill,
         ):
             with self.assertRaises(SceneError):
                 runtime.stop(["xpra", "stop", ":100"])
