@@ -16,6 +16,7 @@ function consolePage({
   weatherOk = true,
   sceneControl = false,
   plannerUrl = "",
+  sceneStatus = null,
 } = {}) {
   const elements = new Map();
   function element() {
@@ -49,7 +50,7 @@ function consolePage({
     requests: [],
     focuses: 0,
     windowFocuses: 0,
-    sceneStatus: {
+    sceneStatus: sceneStatus || {
       phase: "ready",
       scene: "airsimnh",
       instance_id: "initial",
@@ -132,6 +133,7 @@ function consolePage({
       }
       if (url === "/api/weather" && state.weatherWait) await state.weatherWait;
       const ok = url === "/api/airsim" ? state.connected : state.weatherOk;
+      if (url === "/api/weather" && ok) state.sceneStatus.weather = weather;
       return {
         ok,
         json: async () =>
@@ -155,43 +157,30 @@ function consolePage({
 }
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-test("first connection applies clear and selects it after RPC succeeds", async () => {
+test("opening and checking a page never writes default weather", async () => {
   const page = consolePage();
   await settle();
-  assert.equal(page.run("selected.weather"), "clear");
-  assert.equal(
-    page.elements.get("#weather-status").textContent,
-    "已应用：晴朗",
-  );
-  assert.equal(
-    page.state.requests.filter((r) => r.weather === "clear").length,
-    1,
-  );
-  await page.run("checkAirSim()");
-  assert.equal(
-    page.state.requests.filter((r) => r.weather === "clear").length,
-    1,
-  );
-});
-
-test("offline connection waits and initializes clear after recovery", async () => {
-  const page = consolePage({ connected: false });
-  await settle();
   assert.equal(page.run("selected.weather"), null);
-  assert.equal(page.state.requests.filter((r) => r.weather).length, 0);
+  await page.run("checkAirSim()");
+  assert.equal(page.state.requests.filter(r => r.url === "/api/weather").length, 0);
+});
+test("offline recovery remains read-only", async () => {
+  const page = consolePage({connected:false});
+  await settle();
   page.state.connected = true;
   await page.run("checkAirSim()");
-  assert.equal(page.run("selected.weather"), "clear");
-});
-
-test("failed default is not marked applied and is retried after recovery", async () => {
-  const page = consolePage({ weatherOk: false });
-  await settle();
   assert.equal(page.run("selected.weather"), null);
-  assert.equal(page.elements.get("#weather-status").dataset.state, "error");
+  assert.equal(page.state.requests.filter(r => r.url === "/api/weather").length, 0);
+});
+test("health recovery does not retry a failed weather write", async () => {
+  const page = consolePage({weatherOk:false});
+  await settle();
+  await page.run("applyWeather(options.weather.find(item => item.id === 'rain'))");
+  assert.equal(page.run("selected.weather"), null);
   page.state.weatherOk = true;
   await page.run("checkAirSim()");
-  assert.equal(page.run("selected.weather"), "clear");
+  assert.equal(page.run("selected.weather"), null);
+  assert.equal(page.state.requests.filter(r => r.url === "/api/weather").length, 1);
 });
 
 test("periodic health checks preserve manually selected rain", async () => {
@@ -207,7 +196,7 @@ test("periodic health checks preserve manually selected rain", async () => {
   assert.equal(page.run("selected.weather"), "rain");
   assert.equal(
     page.state.requests.filter((r) => r.weather === "clear").length,
-    1,
+    0,
   );
 });
 
@@ -262,14 +251,13 @@ test("resume control returns keyboard focus without restarting the stream", asyn
   assert.equal(page.state.windowFocuses, 1);
 });
 
-test("managed page initializes clear against the actual instance and renders fixed scenes", async () => {
+test("managed page reads backend-initialized weather without writing it", async () => {
   const page = consolePage({ sceneControl: true });
   await settle();
   assert.equal(page.run("selected.scene"), "airsimnh");
   assert.equal(page.run("selected.weather"), "clear");
   assert.equal(page.elements.get("#scene-overlay").hidden, true);
-  const request = page.state.requests.find((r) => r.url === "/api/weather");
-  assert.equal(request.body.instance_id, "initial");
+  assert.equal(page.state.requests.filter(r => r.url === "/api/weather").length, 0);
   assert.equal(
     page.run("options.scene.map(s=>s.id).join()"),
     "airsimnh,abandonedpark,msbuild2018",
@@ -374,4 +362,39 @@ test("manual focus still respects scene readiness and open dialogs", async () =>
   assert.equal(page.state.focuses, 0);
   page.run("scenePhase='ready'; modal.open=true; focusAirSim(true)");
   assert.equal(page.state.focuses, 0);
+});
+
+test("opening or refreshing another page preserves shared scene weather", async () => {
+  const first = consolePage({sceneControl:true});
+  await settle();
+  for (const weather of ["rain","fog","snow"]) {
+    await first.run("applyWeather(options.weather.find(item => item.id === '" + weather + "'))");
+    const refreshed = consolePage({sceneControl:true,sceneStatus:first.state.sceneStatus});
+    await settle();
+    assert.equal(refreshed.run("selected.weather"), weather);
+    assert.equal(refreshed.state.requests.filter(r => r.url === "/api/weather").length, 0);
+    assert.equal(first.state.sceneStatus.weather, weather);
+    await first.run("pollScenes()");
+    assert.equal(first.run("selected.weather"), weather);
+  }
+});
+test("unknown scene weather is not replaced by a guessed default", async () => {
+  const page = consolePage({sceneControl:true});
+  await settle();
+  page.state.sceneStatus.weather = null;
+  await page.run("pollScenes()");
+  assert.equal(page.run("selected.weather"), null);
+  assert.match(page.elements.get("#weather-status").textContent, /未确认/);
+  assert.equal(page.state.requests.filter(r => r.url === "/api/weather").length, 0);
+});
+test("a new scene reads its backend clear preset without an extra weather write", async () => {
+  const page = consolePage({sceneControl:true});
+  await settle();
+  await page.run("applyWeather(options.weather.find(item => item.id === 'snow'))");
+  const before = page.state.requests.filter(r => r.url === "/api/weather").length;
+  page.state.sceneStatus = {...page.state.sceneStatus,instance_id:"new-instance",
+    weather:"clear",revision:page.state.sceneStatus.revision+1};
+  await page.run("pollScenes()");
+  assert.equal(page.run("selected.weather"), "clear");
+  assert.equal(page.state.requests.filter(r => r.url === "/api/weather").length, before);
 });

@@ -43,10 +43,10 @@ main{padding-bottom:24px}
 
 .weather-status{flex-shrink:0;font-size:10px;line-height:1.7;margin:14px 0 0;color:#839b8b;overflow-wrap:anywhere}.weather-status[data-state=success]{color:var(--mint)}.weather-status[data-state=error]{color:#e6a391}.weather-status[data-state=pending]{color:#c8d3a1}#weather-list .option-button:disabled{opacity:.55;cursor:wait}#weather-list .option-button:disabled:hover{color:inherit}
 
-/* Compact connection toolbar; the workspace starts without the promotional header. */
-.console-toolbar{display:flex;justify-content:flex-end;margin-bottom:16px}
+/* Connection settings follow the weather panel. */
+.console-toolbar{display:flex;margin:0}
 #xpra-frame:focus-visible{outline:2px solid var(--mint);outline-offset:-2px}
-@media(max-width:560px){main{padding-top:16px}.console-toolbar{margin-bottom:12px}}
+@media(max-width:560px){main{padding-top:16px}.console-toolbar{margin:0}}
 
 /* Real scene lifecycle: block remote input until the target instance is ready. */
 .viewport .landscape{background-image:none;background:#101415}
@@ -87,3 +87,7 @@ button:disabled { cursor:not-allowed; opacity:.45; }
 .planner-settings-actions .modal-action{margin-top:0}
 #planner-task-id{flex-basis:100%;overflow-wrap:anywhere;color:var(--mint)}
 #planner-task-id:empty,.command-feedback:empty{display:none}
+.app-shell main{padding-top:16px}
+.console-toolbar .outline-button{width:100%;justify-content:center;align-self:auto;margin-top:0}
+@media(min-width:561px) and (max-width:850px){.control-column>.console-toolbar{grid-column:2}}
+@media(max-width:560px){.app-shell main{padding-top:12px}}

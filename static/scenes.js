@@ -47,9 +47,7 @@ async function pollScenes() {
       $("#airsim-status").textContent = "AirSim RPC 已连接 · 场景已就绪";
       $("#airsim-status").dataset.state = "success";
       if (lastReadyInstance !== state.instance_id) {
-        const firstConnection = lastReadyInstance === null;
         lastReadyInstance = state.instance_id;
-        weatherInitialized = !firstConnection;
         selected.weather = state.weather;
         connectXpra(activeXpraUrl || DEFAULT_XPRA_URL, false);
       }
@@ -74,8 +72,6 @@ async function pollScenes() {
     if (typeof renderPlanner === "function") renderPlanner();
     renderList("scene");
     if (!weatherPending) renderList("weather");
-    if (state.phase === "ready" && !weatherInitialized && !weatherPending)
-      await applyWeather(options.weather.find((item) => item.id === "clear"));
   } catch (error) {
     $("#scene-status").textContent = "场景状态连接失败，请检查网页服务";
     $("#scene-status").dataset.state = "error";

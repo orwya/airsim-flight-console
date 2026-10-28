@@ -13,8 +13,6 @@
 
   <div class="app-shell">
     <main>
-      <div class="console-toolbar"><button class="outline-button" id="connect"><span data-icon="link"></span><span id="connect-label">连接设置</span><span class="small-arrow">↗</span></button></div>
-
       <div class="workspace">
         <div class="flight-column">
           <section class="viewport-card" aria-label="无人机模拟画面">
@@ -56,8 +54,9 @@
             <div class="list-summary"><span>天气列表</span><span id="weather-count"></span></div>
             <div class="option-list" id="weather-list" role="group" aria-label="天气列表" tabindex="0"></div>
             <p id="airsim-status" class="weather-status" role="status">正在检查 AirSim RPC…</p>
-            <p id="weather-status" class="weather-status" role="status">等待连接后应用默认天气：晴朗</p>
+            <p id="weather-status" class="weather-status" role="status">等待同步场景天气</p>
           </section>
+          <div class="console-toolbar"><button class="outline-button" id="connect"><span data-icon="link"></span><span id="connect-label">连接设置</span><span class="small-arrow">↗</span></button></div>
         </aside>
       </div>
     </main>

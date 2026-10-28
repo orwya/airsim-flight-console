@@ -37,6 +37,10 @@ document
 renderIcons();
 const $ = (s) => document.querySelector(s);
 const viewport = $("#viewport");
+// Move the existing button when Flask still serves a cached toolbar layout.
+const connectionToolbar = $(".console-toolbar");
+const controlColumn = $(".control-column");
+if (connectionToolbar && controlColumn) controlColumn.append(connectionToolbar);
 let toastTimer;
 function toast(message) {
   $("#toast").textContent = message;
@@ -229,7 +233,7 @@ const options = {
 };
 const selected = { scene: null, weather: null };
 let weatherPending = false;
-let weatherInitialized = false;
+$("#weather-status").textContent = SCENE_CONTROL ? "等待同步场景天气" : "请选择天气";
 function renderList(type) {
   const list = $("#" + type + "-list");
   list.replaceChildren();
@@ -312,7 +316,6 @@ async function applyWeather(item, restoreInput = false) {
     )
       return;
     selected.weather = item.id;
-    weatherInitialized = true;
     status.textContent = "已应用：" + item.name;
     status.dataset.state = "success";
     toast("已将 AirSim 天气切换为「" + item.name + "」");
@@ -435,7 +438,7 @@ try {
   toast(error.message);
 }
 
-// The probe is read-only. First successful connection initializes clear weather once per page.
+// Connection checks are read-only. Weather changes require a user action.
 let rpcCheckPending = false;
 async function checkAirSim() {
   if (rpcCheckPending || document.hidden || weatherPending) return;
@@ -453,9 +456,6 @@ async function checkAirSim() {
       throw new Error(result.message || "AirSim RPC 未连接");
     status.textContent = "AirSim RPC 已连接 · 可切换天气";
     status.dataset.state = "success";
-    if (!weatherInitialized && !weatherPending) {
-      await applyWeather(options.weather.find((item) => item.id === "clear"));
-    }
   } catch (error) {
     status.textContent =
       error.name === "AbortError"

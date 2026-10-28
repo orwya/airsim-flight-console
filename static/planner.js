@@ -286,7 +286,7 @@ function applyPlannerBase(value) {
   }
 }
 function showPlannerDisabledNotice() {
-  $("#command-feedback").textContent = "Planner 未配置；在右上角“连接设置”里填写 Planner 地址。";
+  $("#command-feedback").textContent = "Planner 未配置；在天气条件框下方的“连接设置”里填写 Planner 地址。";
   $("#planner-log-status").textContent = "Planner 未配置";
 }
 // 设置弹窗可能未打开，写入前先确认提示元素存在。
