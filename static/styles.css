@@ -62,13 +62,12 @@ main{padding-bottom:24px}
 .planner-toolbar .scene-cleanup { width:auto; margin:0 0 0 auto; padding:8px 14px; }
 #planner-status { font-size:13px; color:#adb9b9; }
 #planner-status[data-state="idle"] { color:#a5dd80; }
-#planner-status[data-state="running"],.planner-warning { color:#edc78b; }
+#planner-status[data-state="running"] { color:#edc78b; }
 #planner-task-id,.planner-hint,#planner-log-status { font-size:12px; color:#9aabaa; }
 .planner-log-toolbar { font-size:12px; color:#c7d3d0; }
 .planner-log-toolbar label { display:flex; align-items:center; gap:5px; margin-left:auto; }
 .planner-log-toolbar button { border:1px solid #394743; border-radius:6px; background:transparent; color:inherit; padding:6px 10px; cursor:pointer; }
 #planner-logs { margin:12px 0; padding:14px; height:260px; overflow:auto; background:#0b1010; border:1px solid #293630; border-radius:8px; color:#c3d4c9; font:12px/1.65 monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-.planner-warning,.planner-hint { line-height:1.6; }
 #command-feedback { white-space:pre-wrap; overflow-wrap:anywhere; }
 button:disabled { cursor:not-allowed; opacity:.45; }
 

@@ -21,6 +21,7 @@ const plannerLabels = {
   running: "任务执行中（含解析、规划和飞行）", stopping: "正在停止任务",
 };
 let plannerActiveRecord = null;
+let plannerRemoteInstruction = null;
 const PLANNER_HISTORY_LIMIT = 100;
 function updatePlannerTaskState(state) {
   if (!plannerActiveRecord || !plannerActiveRecord.accepted) return;
@@ -38,13 +39,17 @@ function updatePlannerTaskState(state) {
 function renderPlanner() {
   $("#planner-status").textContent = plannerLabels[plannerState] || plannerLabels.unknown;
   $("#planner-status").dataset.state = plannerState;
-  $("#planner-task-id").textContent = plannerActiveRecord
-    ? plannerActiveRecord.status + "：" + plannerActiveRecord.command
-    : ["running", "stopping"].includes(plannerState) ? "当前指令内容未知（由其他页面提交）" : "";
+  const active = ["running", "stopping"].includes(plannerState);
+  const instruction = plannerRemoteInstruction !== null
+    ? plannerRemoteInstruction : plannerActiveRecord?.accepted ? plannerActiveRecord.command : "";
+  $("#planner-task-id").textContent = active
+    ? instruction
+      ? (plannerState === "stopping" ? "正在停止：" : "执行中：") + instruction
+      : plannerRemoteInstruction === "" ? "" : "当前指令内容未知（Planner 未提供指令内容）"
+    : "";
   $("#planner-start").disabled = !plannerEnabled || plannerPending ||
     plannerState !== "idle" || scenePhase !== "ready" || sceneBusy || weatherPending;
   $("#planner-stop").disabled = !plannerEnabled || plannerPending || plannerState !== "running";
-  $("#planner-warning").hidden = plannerState !== "running" && plannerState !== "stopping";
 }
 async function plannerRequest(path, options = {}, base = plannerBase) {
   const controller = new AbortController();
@@ -81,9 +86,18 @@ function plannerStateFrom(body) {
     throw new Error("Planner 返回无效状态");
   return body.state;
 }
-async function plannerStatus(base) {
+async function plannerStatusSnapshot(base) {
   const {body} = await plannerRequest("/api/status", {}, base);
-  return plannerStateFrom(body);
+  const state = plannerStateFrom(body);
+  if ("instruction" in body && typeof body.instruction !== "string")
+    throw new Error("Planner 返回无效指令内容");
+  // Older Planner versions omit instruction. Never substitute logs or task IDs.
+  const instruction = !["running", "stopping"].includes(state)
+    ? "" : "instruction" in body ? body.instruction : null;
+  return {state, instruction};
+}
+async function plannerStatus(base) {
+  return (await plannerStatusSnapshot(base)).state;
 }
 async function pollPlannerStatus() {
   if (!plannerEnabled || plannerStatusPending) return;
@@ -91,13 +105,24 @@ async function pollPlannerStatus() {
   const epoch = plannerEpoch;
   try {
     if (document.hidden) return;
-    const state = await plannerStatus();
+    const {state, instruction} = await plannerStatusSnapshot();
     if (epoch !== plannerEpoch || plannerPending) return;
     plannerState = state;
+    plannerRemoteInstruction = instruction;
+    if (plannerActiveRecord?.accepted && ["running", "stopping"].includes(state)
+        && instruction !== null && instruction !== plannerActiveRecord.command) {
+      plannerActiveRecord.status = "当前任务已变更，原任务结果见日志";
+      plannerActiveRecord = null;
+    }
+    if (state === "connecting" && plannerActiveRecord?.accepted) {
+      plannerActiveRecord.status = "连接中，原任务结果未确认";
+      plannerActiveRecord = null;
+    }
     updatePlannerTaskState(state);
   } catch (error) {
     if (epoch === plannerEpoch && !plannerPending) {
       plannerState = "unknown";
+      plannerRemoteInstruction = null;
       updatePlannerTaskState("unknown");
       $("#planner-status-detail").textContent = "状态连接异常：" + error.message;
     }
@@ -191,17 +216,20 @@ async function plannerCommand(stop = false) {
     if (stop && ![200, 202].includes(status)) throw new Error("停止响应无效");
     plannerState = nextState;
     if (stop) {
+      if (!["running", "stopping"].includes(nextState)) plannerRemoteInstruction = "";
       updatePlannerTaskState(nextState);
       $("#command-feedback").textContent = "停止请求已返回 " + nextState + "；等待实际空闲后再提交。";
     } else {
       record.taskId = body.task_id;
       record.accepted = true;
       record.status = "执行中";
+      plannerRemoteInstruction = instruction;
       $("#command-feedback").textContent = "";
       if ($("#command").value.trim() === instruction) $("#command").value = "";
     }
   } catch (error) {
     const rejected = [409, 422, 503].includes(error.status);
+    plannerRemoteInstruction = null;
     if (record) {
       record.status = rejected ? "未接收" : "结果未确认";
       if (rejected && plannerActiveRecord === record) plannerActiveRecord = null;
@@ -238,6 +266,7 @@ function applyPlannerBase(value) {
     plannerActiveRecord = null;
   }
   plannerBase = value;
+  plannerRemoteInstruction = null;
   plannerEnabled = Boolean(value);
   plannerState = plannerEnabled ? "unknown" : "disabled";
   plannerEpoch++;

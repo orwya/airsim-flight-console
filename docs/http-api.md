@@ -119,3 +119,12 @@ Planner 的请求由浏览器直接发出。地址取页面的预填值，或者
 ## 测试覆盖
 
 自动测试覆盖路由、状态机、端口派生和场景操作的互斥。实机验收范围见 [README](../README.md)。
+## 跨设备显示当前指令
+
+浏览器每秒直接查询同一个 Planner 的 GET /api/status，读取 state 和 instruction：
+
+    {"state": "running", "instruction": "上升10m"}
+
+instruction 为用户提交的完整指令原文。running、stopping 时显示该内容；idle、connecting 时清空当前指令。新打开或刷新页面也从此接口恢复显示，无需同步其他浏览器的输入框或本地存储。
+
+该功能要求 Planner 实现带 instruction 字段的状态接口。旧版本只返回 state 时，本页仍可显示自己提交的指令，其他设备只能显示内容未知。HTTP 状态中的 idle 不能证明任务成功。

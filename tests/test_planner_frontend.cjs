@@ -44,7 +44,8 @@ function page({enabled = true} = {}) {
     fetch:async(path, options={})=>{
       requests.push({path,options});
       if(state.handler) {const result = await state.handler(path,options); if(result) return result;}
-      if(path.endsWith("/status")) return response({state:state.value});
+      if(path.endsWith("/status")) return response({state:state.value,
+        ...(state.instruction === undefined ? {} : {instruction:state.instruction})});
       if(path.includes("/logs?")) return response(state.logs);
       if(path.endsWith("/tasks")) {state.value="running"; return response({state:"running",task_id:"opaque_task"},202);}
       if(path.endsWith("/stop")) {state.value="stopping"; return response({state:"stopping"},202);}
@@ -346,4 +347,99 @@ test("current instruction uses text and clearing logs preserves task state",asyn
   assert.equal(p.element("#planner-task-id").innerHTML,undefined);
   p.element("#planner-clear").listeners.click();
   assert.equal(p.context.history.length,1);
+});
+
+test("a second browser reads the full instruction without submitting a task",async()=>{
+  const first=page(),second=page();
+  let snapshot={state:"idle",instruction:""};
+  const command="飞到右前方第一辆红色汽车附近，然后上升10m";
+  for(const p of [first,second])p.state.handler=async(path,options)=>{
+    if(path.endsWith("/tasks")){
+      snapshot={state:"running",instruction:JSON.parse(options.body).instruction};
+      return p.response({state:"running",task_id:"task_shared"},202);
+    }
+    if(path.endsWith("/status"))return p.response({...snapshot});
+  };
+  first.element("#command").value=command;
+  await first.run("plannerCommand()");await settle();
+  await second.run("pollPlannerStatus()");
+  for(const p of [first,second]){
+    assert.equal(p.element("#planner-task-id").textContent,"执行中："+command);
+    assert.doesNotMatch(p.element("#planner-task-id").textContent,/task_shared/);
+  }
+  assert.equal(second.element("#command").value,"");
+  assert.equal(second.context.history.length,0);
+  assert.equal(second.state.calls.filter(x=>x.options.method==="POST").length,0);
+  snapshot={state:"stopping",instruction:command};
+  await second.run("pollPlannerStatus()");
+  assert.equal(second.element("#planner-task-id").textContent,"正在停止："+command);
+  snapshot={state:"idle",instruction:""};
+  await second.run("pollPlannerStatus()");
+  assert.equal(second.element("#planner-task-id").textContent,"");
+});
+test("connecting and idle clear remote instructions even if a stale body contains one",async()=>{
+  const p=page();
+  p.state.value="running";p.state.instruction="上升10m";
+  await p.run("pollPlannerStatus()");
+  for(const state of ["connecting","idle"]){
+    p.state.value=state;await p.run("pollPlannerStatus()");
+    assert.equal(p.element("#planner-task-id").textContent,"");
+    assert.equal(p.run("plannerRemoteInstruction"),"");
+  }
+});
+test("the server snapshot replaces an old local instruction when another task starts",async()=>{
+  const p=page();p.element("#command").value="上升10m";
+  await p.run("plannerCommand()");await settle();
+  p.state.instruction="飞到左前方车辆附近";p.state.value="running";
+  await p.run("pollPlannerStatus()");
+  assert.equal(p.element("#planner-task-id").textContent,"执行中：飞到左前方车辆附近");
+  assert.equal(p.run("plannerActiveRecord"),null);
+});
+test("a rejected task does not replace the instruction reported by Planner",async()=>{
+  const p=page();p.element("#command").value="不应显示的新指令";
+  p.state.handler=async path=>{
+    if(path.endsWith("/tasks"))return p.response({detail:{state:"running",message:"busy"}},409);
+    if(path.endsWith("/status"))return p.response({state:"running",instruction:"正在执行的旧指令"});
+  };
+  await p.run("plannerCommand()");await settle();
+  assert.equal(p.element("#planner-task-id").textContent,"执行中：正在执行的旧指令");
+  assert.equal(p.element("#command").value,"不应显示的新指令");
+});
+test("invalid instruction types hide stale content and report an invalid response",async()=>{
+  for(const instruction of [null,42,[],{}]){
+    const p=page();p.state.value="running";p.state.instruction=instruction;
+    await p.run("pollPlannerStatus()");
+    assert.equal(p.context.plannerState,"unknown");
+    assert.equal(p.element("#planner-task-id").textContent,"");
+    assert.match(p.element("#planner-status-detail").textContent,/无效指令内容/);
+  }
+});
+test("a late status snapshot cannot overwrite a newly accepted instruction",async()=>{
+  const p=page();let release;
+  p.state.handler=async path=>{
+    if(path.endsWith("/status")){
+      await new Promise(resolve=>release=resolve);
+      return p.response({state:"running",instruction:"旧指令"});
+    }
+  };
+  const old=p.run("pollPlannerStatus()");
+  p.element("#command").value="上升10m";
+  await p.run("plannerCommand()");
+  release();await old;
+  assert.equal(p.element("#planner-task-id").textContent,"执行中：上升10m");
+});
+test("remote instruction markup is displayed as text and a failed read hides it",async()=>{
+  const p=page();p.state.value="running";p.state.instruction="<img onerror=alert(1)>";
+  await p.run("pollPlannerStatus()");
+  assert.equal(p.element("#planner-task-id").textContent,"执行中：<img onerror=alert(1)>");
+  assert.equal(p.element("#planner-task-id").innerHTML,undefined);
+  p.state.handler=async()=>{throw new TypeError("offline");};
+  await p.run("pollPlannerStatus()");
+  assert.equal(p.element("#planner-task-id").textContent,"");
+});
+
+test("stopping without a current task shows no stale instruction",async()=>{
+  const p=page();p.state.value="stopping";p.state.instruction="";
+  await p.run("pollPlannerStatus()");
+  assert.equal(p.element("#planner-task-id").textContent,"");
 });
