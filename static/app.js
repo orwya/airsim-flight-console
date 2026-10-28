@@ -8,8 +8,6 @@ const icons = {
   link: '<path d="m10 7 2-2a5 5 0 0 1 7 7l-2 2m-3 3-2 2a5 5 0 0 1-7-7l2-2m2 5 6-6"/>',
   signal: '<path d="M4 20v-3m5 3v-7m5 7V9m5 11V4"/>',
   navigation: '<path d="m12 3 8 18-8-4-8 4Z"/>',
-  camera:
-    '<path d="m8 6 2-3h4l2 3h4a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13" r="4"/>',
   focus:
     '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><circle cx="12" cy="12" r="3"/>',
   expand:
@@ -21,8 +19,6 @@ const icons = {
   fog: '<path d="M4 9h16M2 13h14m3 0h3M5 17h14M8 5h8"/>',
   terminal: '<path d="m4 7 5 5-5 5m8 0h8"/>',
   arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
-  shield:
-    '<path d="M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6Z"/><path d="m8 12 3 3 5-6"/>',
   sliders:
     '<path d="M5 3v5m0 4v9M12 3v10m0 4v4M19 3v3m0 4v11M2 8h6m1 9h6m1-11h6"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/>',
@@ -34,6 +30,10 @@ const renderIcons = (root = document) =>
   root
     .querySelectorAll("[data-icon]")
     .forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
+// Remove obsolete elements from templates cached by the running Flask process.
+document
+  .querySelectorAll(".camera-label, .view-label .subtle, #view-mode-label, #capture, .panel-description, .bottom-note, .app-footer")
+  .forEach(element => element.remove());
 renderIcons();
 const $ = (s) => document.querySelector(s);
 const viewport = $("#viewport");
@@ -145,7 +145,6 @@ function connectXpra(value, remember = true) {
   clearTimeout(connectionTimer);
   viewport.classList.add("remote-mode");
   frame.hidden = false;
-  $("#view-mode-label").textContent = "xpra 远程窗口";
   $("#connect-label").textContent = "连接设置";
   $("#feed-status").textContent = "正在打开 xpra 客户端…";
   $("#open-feed").href = url.href;
@@ -163,7 +162,6 @@ function disconnectXpra() {
   $("#xpra-frame").hidden = true;
   $("#xpra-frame").removeAttribute("src");
   viewport.classList.remove("remote-mode");
-  $("#view-mode-label").textContent = "画面未连接";
   $("#feed-status").textContent = "画面已断开，可通过连接设置重新连接";
   $("#connect-label").textContent = "连接 AirSim";
   $(".feed-actions").hidden = true;
@@ -364,23 +362,6 @@ $("#fullscreen").addEventListener("click", async () => {
     toast("当前预览环境不支持全屏，请在独立浏览器中打开");
   }
 });
-const captures = [];
-$("#capture").addEventListener("click", () => {
-  if (remoteActive) {
-    toast("远程画面截图需接入图像接口，当前无法保存真实截图");
-    return;
-  }
-  captures.unshift({
-    scene:
-      options.scene.find((item) => item.id === selected.scene)?.name ||
-      "未选择场景",
-    weather:
-      options.weather.find((item) => item.id === selected.weather)?.name ||
-      "天气未设置",
-    time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
-  });
-  toast("已将当前演示画面信息保存至媒体库（本次会话）");
-});
 const modal = $("#modal");
 function openModal(type) {
   const content = $("#modal-content");
@@ -417,19 +398,6 @@ function openModal(type) {
         const row = document.createElement("div");
         row.className = "media-item";
         row.textContent = `${item.time} · ${item.command} · ${item.status || "状态未确认"}`;
-        content.append(row);
-      });
-  }
-  if (type === "media") {
-    $("#modal-title").textContent = "媒体库";
-    content.replaceChildren();
-    if (!captures.length)
-      content.innerHTML = `<div class="empty-state">${icon("camera")}<p>你的探索，值得被记录</p><p>点击画面上方的相机按钮，保存演示画面信息。<br>真实截图与视频将在视频流接入后提供。</p></div>`;
-    else
-      captures.forEach((item) => {
-        const row = document.createElement("div");
-        row.className = "media-item";
-        row.textContent = `${item.time} · ${item.scene} · ${item.weather}（演示信息）`;
         content.append(row);
       });
   }
