@@ -15,16 +15,32 @@ let plannerCursor = 0;
 let plannerLogsEpoch = 0;
 let plannerLogRows = [];
 let plannerSeenIds = new Set();
-let plannerTaskId = "";
 const plannerLabels = {
   disabled: "Planner 未配置", unknown: "Planner 状态未确认",
   connecting: "Planner 连接准备中", idle: "可接受新任务",
   running: "任务执行中（含解析、规划和飞行）", stopping: "正在停止任务",
 };
+let plannerActiveRecord = null;
+const PLANNER_HISTORY_LIMIT = 100;
+function updatePlannerTaskState(state) {
+  if (!plannerActiveRecord || !plannerActiveRecord.accepted) return;
+  if (state === "idle") {
+    plannerActiveRecord.status = "执行已结束";
+    plannerActiveRecord = null;
+  } else if (state === "running") {
+    plannerActiveRecord.status = "执行中";
+  } else if (state === "stopping") {
+    plannerActiveRecord.status = "正在停止";
+  } else {
+    plannerActiveRecord.status = "状态未确认";
+  }
+}
 function renderPlanner() {
   $("#planner-status").textContent = plannerLabels[plannerState] || plannerLabels.unknown;
   $("#planner-status").dataset.state = plannerState;
-  $("#planner-task-id").textContent = plannerTaskId ? "最近接收：" + plannerTaskId : "";
+  $("#planner-task-id").textContent = plannerActiveRecord
+    ? plannerActiveRecord.status + "：" + plannerActiveRecord.command
+    : ["running", "stopping"].includes(plannerState) ? "当前指令内容未知（由其他页面提交）" : "";
   $("#planner-start").disabled = !plannerEnabled || plannerPending ||
     plannerState !== "idle" || scenePhase !== "ready" || sceneBusy || weatherPending;
   $("#planner-stop").disabled = !plannerEnabled || plannerPending || plannerState !== "running";
@@ -78,9 +94,11 @@ async function pollPlannerStatus() {
     const state = await plannerStatus();
     if (epoch !== plannerEpoch || plannerPending) return;
     plannerState = state;
+    updatePlannerTaskState(state);
   } catch (error) {
     if (epoch === plannerEpoch && !plannerPending) {
       plannerState = "unknown";
+      updatePlannerTaskState("unknown");
       $("#planner-status-detail").textContent = "状态连接异常：" + error.message;
     }
   } finally {
@@ -156,7 +174,12 @@ async function plannerCommand(stop = false) {
   renderPlanner();
   const record = stop ? null : {command: instruction,
     time: new Date().toLocaleTimeString("zh-CN", {hour12: false}), status: "提交中"};
-  if (record) history.unshift(record);
+  if (record) {
+    history.unshift(record);
+    history.length = Math.min(history.length, PLANNER_HISTORY_LIMIT);
+    plannerActiveRecord = record;
+    renderPlanner();
+  }
   try {
     const {body, status} = await plannerRequest(stop ? "/api/stop" : "/api/tasks", stop
       ? {method: "POST"}
@@ -168,16 +191,21 @@ async function plannerCommand(stop = false) {
     if (stop && ![200, 202].includes(status)) throw new Error("停止响应无效");
     plannerState = nextState;
     if (stop) {
+      updatePlannerTaskState(nextState);
       $("#command-feedback").textContent = "停止请求已返回 " + nextState + "；等待实际空闲后再提交。";
     } else {
-      plannerTaskId = body.task_id;
-      record.status = "已接收 " + body.task_id + "；结果见日志";
-      $("#command-feedback").textContent = "已接收 " + body.task_id + "，不代表任务完成，请查看日志。";
+      record.taskId = body.task_id;
+      record.accepted = true;
+      record.status = "执行中";
+      $("#command-feedback").textContent = "";
       if ($("#command").value.trim() === instruction) $("#command").value = "";
     }
   } catch (error) {
     const rejected = [409, 422, 503].includes(error.status);
-    if (record) record.status = rejected ? "未接收" : "结果未确认";
+    if (record) {
+      record.status = rejected ? "未接收" : "结果未确认";
+      if (rejected && plannerActiveRecord === record) plannerActiveRecord = null;
+    }
     plannerState = ["connecting", "running", "stopping", "idle"].includes(error.body?.detail?.state)
       ? error.body.detail.state : "unknown";
     $("#command-feedback").textContent = error.message + "\n" +
@@ -205,6 +233,10 @@ function normalizePlannerBase(value) {
   return text;
 }
 function applyPlannerBase(value) {
+  if (value !== plannerBase && plannerActiveRecord) {
+    plannerActiveRecord.status = "连接已切换，状态未确认";
+    plannerActiveRecord = null;
+  }
   plannerBase = value;
   plannerEnabled = Boolean(value);
   plannerState = plannerEnabled ? "unknown" : "disabled";
@@ -234,7 +266,7 @@ function setPlannerResult(text) {
   if (box) box.textContent = text;
 }
 function plannerSettingsHTML() {
-  return '<div class="planner-settings"><p>Planner 由页面直接连接，后端不转发。启动时加 --planner-port 会自动填入；也可在这里手动填写，Planner 的跨域设置必须允许本页来源。</p><label class="modal-field" for="planner-endpoint">Planner 地址</label><input class="modal-input" id="planner-endpoint" placeholder="http://172.27.137.174:8080"/><p class="weather-status" id="planner-test-result" role="status"></p><button class="modal-action" type="button" id="planner-test">测试连接</button><button class="modal-action" type="button" id="planner-save">保存 Planner 地址</button></div>';
+  return '<div class="planner-settings"><p>Planner 由页面直接连接，后端不转发。启动时加 --planner-port 会自动填入；也可在这里手动填写，Planner 的跨域设置必须允许本页来源。</p><label class="modal-field" for="planner-endpoint">Planner 地址</label><input class="modal-input" id="planner-endpoint" placeholder="http://172.27.137.174:8080"/><p class="weather-status" id="planner-test-result" role="status"></p><div class="planner-settings-actions"><button class="modal-action" type="button" id="planner-test">测试连接</button><button class="modal-action" type="button" id="planner-save">保存 Planner 地址</button></div></div>';
 }
 function mountPlannerSettings() {
   $("#planner-endpoint").value = plannerBase;
@@ -316,6 +348,7 @@ async function stopThenSwitch() {
     }
     if (state === "idle") {
       plannerState = "idle";
+      updatePlannerTaskState("idle");
       renderPlanner();
       return true;
     }

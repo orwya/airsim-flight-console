@@ -10,8 +10,15 @@ const BASE = "http://planner.test:8080";
 
 function page({enabled = true} = {}) {
   const elements = new Map(), requests = [];
+  function node() {
+    return {textContent:"", dataset:{}, children:[],
+      setAttribute(){},
+      append(...items){this.children.push(...items);},
+      replaceChildren(...items){this.children=[...items];}};
+  }
   function element(selector) {
     if (!elements.has(selector)) elements.set(selector, {
+      ...node(),
       value: "", textContent: "", disabled: false, hidden: false, checked: true,
       dataset: {}, scrollHeight: 100, scrollTop: 0, clientHeight: 100,
       listeners: {}, addEventListener(type, callback) {this.listeners[type] = callback;},
@@ -26,7 +33,7 @@ function page({enabled = true} = {}) {
     scenePhase:"ready", sceneBusy:false, weatherPending:false, history:[],
     asked:0,
     document:{hidden:false,body:{dataset:{plannerUrl:enabled ? BASE : ""}},
-      addEventListener(){}},
+      addEventListener(){}, createElement:()=>node()},
     $:element, AbortController, Date, URL,
     localStorage:(()=>{const store=new Map();return {
       getItem:key=>store.has(key)?store.get(key):null,
@@ -76,8 +83,10 @@ test("exact Chinese task is sent once and acceptance is not success",async()=>{
   const p=page(); p.element("#command").value="飞到红色汽车附近";
   await Promise.all([p.run("plannerCommand()"),p.run("plannerCommand()")]);
   assert.equal(p.state.calls.filter(x=>x.path.endsWith("/tasks")).length,1);
-  assert.match(p.element("#command-feedback").textContent,/不代表任务完成/);
-  assert.match(p.context.history[0].status,/已接收/);
+  assert.equal(p.element("#command-feedback").textContent,"");
+  assert.match(p.element("#planner-task-id").textContent,/飞到红色汽车附近/);
+  assert.doesNotMatch(p.element("#planner-task-id").textContent,/opaque_task/);
+  assert.equal(p.context.history[0].status,"执行中");
   assert.equal(p.element("#command").value,"");
   await settle();
 });
@@ -288,4 +297,53 @@ test("clearing without a startup default reports an unconfigured planner",()=>{
   p.run("plannerSaveAddress('')");
   assert.equal(p.context.plannerEnabled,false);
   assert.match(p.element("#planner-test-result").textContent,/未配置/);
+});
+
+test("instruction text remains visible after execution ends without claiming success",async()=>{
+  const p=page();p.element("#command").value="上升10m";
+  await p.run("plannerCommand()");await settle();
+  assert.match(p.element("#planner-task-id").textContent,/执行中：上升10m/);
+  p.state.value="idle";
+  await p.run("pollPlannerStatus()");
+  assert.equal(p.context.history[0].command,"上升10m");
+  assert.equal(p.context.history[0].status,"执行已结束");
+  assert.equal(p.element("#planner-task-id").textContent,"");
+  assert.doesNotMatch(p.context.history[0].status,/成功/);
+  p.element("#command").value="向前飞行2米";
+  await p.run("plannerCommand()");await settle();
+  assert.equal(p.context.history.length,2);
+  assert.equal(p.context.history[1].command,"上升10m");
+});
+test("a task with an uncertain submission is not marked executed by idle",async()=>{
+  const p=page();p.element("#command").value="上升10m";
+  p.state.handler=async path=>{if(path.endsWith("/tasks"))throw new TypeError("network");};
+  await p.run("plannerCommand()");await settle();
+  p.state.handler=undefined;p.state.value="idle";
+  await p.run("pollPlannerStatus()");
+  assert.equal(p.context.history[0].status,"结果未确认");
+});
+test("an external task does not reuse the previous instruction",async()=>{
+  const p=page();p.element("#command").value="上升10m";
+  await p.run("plannerCommand()");await settle();
+  p.state.value="idle";await p.run("pollPlannerStatus()");
+  p.state.value="running";await p.run("pollPlannerStatus()");
+  assert.match(p.element("#planner-task-id").textContent,/内容未知/);
+  assert.doesNotMatch(p.element("#planner-task-id").textContent,/上升10m/);
+});
+test("switching Planner addresses keeps history but removes the active association",async()=>{
+  const p=page();p.element("#command").value="上升10m";
+  await p.run("plannerCommand()");await settle();
+  p.run("applyPlannerBase('http://another.test:8080')");
+  assert.equal(p.context.history[0].command,"上升10m");
+  assert.equal(p.context.history[0].status,"连接已切换，状态未确认");
+  assert.equal(p.run("plannerActiveRecord"),null);
+  await settle();
+});
+test("current instruction uses text and clearing logs preserves task state",async()=>{
+  const p=page();p.element("#command").value="<img src=x onerror=alert(1)>";
+  await p.run("plannerCommand()");await settle();
+  assert.equal(p.element("#planner-task-id").textContent,"执行中：<img src=x onerror=alert(1)>");
+  assert.equal(p.element("#planner-task-id").innerHTML,undefined);
+  p.element("#planner-clear").listeners.click();
+  assert.equal(p.context.history.length,1);
 });

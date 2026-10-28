@@ -32,7 +32,7 @@ const renderIcons = (root = document) =>
     .forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
 // Remove obsolete elements from templates cached by the running Flask process.
 document
-  .querySelectorAll(".camera-label, .view-label .subtle, #view-mode-label, #capture, .panel-description, .bottom-note, .app-footer")
+  .querySelectorAll(".camera-label, .view-label .subtle, #view-mode-label, #capture, .panel-description, .bottom-note, .app-footer, .planner-hint, .planner-history")
   .forEach(element => element.remove());
 renderIcons();
 const $ = (s) => document.querySelector(s);

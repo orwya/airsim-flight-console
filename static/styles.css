@@ -50,7 +50,7 @@ main{padding-bottom:24px}
 
 /* Real scene lifecycle: block remote input until the target instance is ready. */
 .viewport .landscape{background-image:none;background:#101415}
-.scene-overlay{position:absolute;inset:0;z-index:3;background:#101415ed;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:#b5c9be;line-height:1.8}
+.scene-overlay{position:absolute;inset:0;z-index:3;background:#000;opacity:1;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:#b5c9be;line-height:1.8}
 .scene-overlay[hidden]{display:none}
 .scene-cleanup{flex-shrink:0;border:1px solid #43584a;border-radius:5px;margin-top:10px;padding:7px;font-size:11px;color:#adc8b5}
 .scene-cleanup:disabled{opacity:.4;cursor:wait}
@@ -83,3 +83,8 @@ button:disabled { cursor:not-allowed; opacity:.45; }
 /* Remove the sidebar, including from previously cached page templates. */
 .rail { display:none; }
 .app-shell { margin-left:0; }
+
+.planner-settings-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}
+.planner-settings-actions .modal-action{margin-top:0}
+#planner-task-id{flex-basis:100%;overflow-wrap:anywhere;color:var(--mint)}
+#planner-task-id:empty,.command-feedback:empty{display:none}
